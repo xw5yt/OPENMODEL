@@ -1,51 +1,365 @@
-import sqlite3, os, time, sys, requests, platform, json, io, subprocess
+import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shutil, threading, textwrap
 from pathlib import Path
+from datetime import datetime
 
+# ─── Windows UTF-8 + VT100 ANSI fix ─────────────────────────────────────────
 if platform.system() == "Windows":
-
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    # Enable VT processing so ANSI escape codes (colors, cursor) work in cmd/WT
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
 
-ascii_art = r"""
-  ______   _______   ________  __    __  __       __   ______   _______   ________  __
- /      \ |       \ |        \|  \  |  \|  \     /  \ /      \ |       \ |        \|  \
-|  $$$$$$\| $$$$$$$\| $$$$$$$$| $$\ | $$| $$\   /  $$|  $$$$$$\| $$$$$$$\| $$$$$$$$| $$
-| $$  | $$| $$__/ $$| $$__    | $$$\| $$| $$$\ /  $$$| $$  | $$| $$  | $$| $$__    | $$
-| $$  | $$| $$    $$| $$  \   | $$$$\ $$| $$$$\  $$$$| $$  | $$| $$  | $$| $$  \   | $$
-| $$  | $$| $$$$$$$ | $$$$$   | $$\$$ $$| $$\$$ $$ $$| $$  | $$| $$  | $$| $$$$$   | $$
-| $$__/ $$| $$      | $$_____ | $$ \$$$$| $$ \$$$| $$| $$__/ $$| $$__/ $$| $$_____ | $$_____
- \$$    $$| $$      | $$     \| $$  \$$$| $$  \$ | $$ \$$    $$| $$    $$| $$     \| $$     \
-  \$$$$$$  \$$       \$$$$$$$$ \$$   \$$ \$$      \$$  \$$$$$$  \$$$$$$$  \$$$$$$$$ \$$$$$$$$
+# ─── ANSI helpers ─────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+ITALIC = "\033[3m"
 
-v1.0.1
-"""
+def rgb(r, g, b):    return f"\033[38;2;{r};{g};{b}m"
+def bg_rgb(r, g, b): return f"\033[48;2;{r};{g};{b}m"
 
-if platform.system() == "Windows":
-    os.system("cls")
-else:
-    os.system("clear")
+C_WHITE   = rgb(218, 218, 224)
+C_GRAY    = rgb(115, 115, 132)
+C_DIM_C   = rgb(50,  50,  60)
+C_ACCENT  = rgb(92,  158, 255)
+C_ACCENT2 = rgb(180, 128, 255)
+C_GREEN   = rgb(78,  205, 110)
+C_RED     = rgb(248, 75,  75)
+C_YELLOW  = rgb(250, 200, 62)
+C_ORANGE  = rgb(248, 152, 52)
+C_TEAL    = rgb(68,  200, 182)
 
-def get_gradient_text(text, start_rgb=(0, 255, 255), end_rgb=(255, 105, 180)):
+BG_PANEL  = bg_rgb(22, 22, 28)
+BG_STATUS = bg_rgb(14, 14, 20)
+BG_CODE   = bg_rgb(18, 20, 30)
+
+VERSION = "v2.1"
+
+# ─── Terminal helpers ──────────────────────────────────────────────────────────
+def tw():
+    return shutil.get_terminal_size((100, 30)).columns
+
+def th():
+    return shutil.get_terminal_size((100, 30)).lines
+
+def strip_ansi(s):
+    return re.sub(r'\033\[[^m]*m', '', s)
+
+def vis_len(s):
+    return len(strip_ansi(s))
+
+def center_print(text, width=None):
+    w   = width or tw()
+    pad = max(0, (w - vis_len(text)) // 2)
+    print(' ' * pad + text)
+
+def clear_screen():
+    # ANSI: erase entire screen + scrollback, then move cursor to top-left
+    # This works reliably in Windows Terminal, cmd, and Linux/macOS
+    sys.stdout.write('\033[3J\033[2J\033[H')
+    sys.stdout.flush()
+
+# ─── Logo ─────────────────────────────────────────────────────────────────────
+LOGO_BIG = [
+    " ██████╗ ██████╗ ███████╗███╗   ██╗███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     ",
+    "██╔═══██╗██╔══██╗██╔════╝████╗  ██║████╗ ████║██╔═══██╗██╔══██╗██╔════╝██║     ",
+    "██║   ██║██████╔╝█████╗  ██╔██╗ ██║██╔████╔██║██║   ██║██║  ██║█████╗  ██║     ",
+    "██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██║╚██╔╝██║██║   ██║██║  ██║██╔══╝  ██║     ",
+    "╚██████╔╝██║     ███████╗██║ ╚████║██║ ╚═╝ ██║╚██████╔╝██████╔╝███████╗███████╗",
+    " ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝",
+]
+
+LOGO_MID = [
+    "┌─┐┌─┐┌─┐┌┐┌┌┬┐┌─┐┌┬┐┌─┐┬  ",
+    "│ │├─┘├┤ │││││││ │ │ │├┤ │  ",
+    "└─┘┴  └─┘┘└┘┴ ┴└─┘ ┴ └─┘┴─┘",
+]
+
+def print_logo():
+    W = tw()
+    print()
+    big_w = len(LOGO_BIG[0])
+    mid_w = len(LOGO_MID[0])
+    if W >= big_w + 4:
+        for i, line in enumerate(LOGO_BIG):
+            ratio = i / max(len(LOGO_BIG) - 1, 1)
+            r = int(92  * (1 - ratio) + 180 * ratio)
+            g = int(158 * (1 - ratio) + 128 * ratio)
+            b = 255
+            pad = (W - big_w) // 2
+            print(' ' * pad + rgb(r, g, b) + BOLD + line + RESET)
+    elif W >= mid_w + 4:
+        for i, line in enumerate(LOGO_MID):
+            ratio = i / max(len(LOGO_MID) - 1, 1)
+            r = int(92  * (1 - ratio) + 180 * ratio)
+            g = int(158 * (1 - ratio) + 128 * ratio)
+            b = 255
+            pad = (W - mid_w) // 2
+            print(' ' * pad + rgb(r, g, b) + BOLD + line + RESET)
+    else:
+        center_print(BOLD + C_ACCENT + 'OPENMODEL' + RESET)
+    print()
+
+# ─── Panel (OpenCode-style: left blue accent bar, subtle bg) ──────────────────
+def _pw():
+    return min(tw() - 8, 68)
+
+def _pp():
+    return (tw() - _pw()) // 2
+
+def _panel_row(content='', use_accent=True, accent_col=None):
+    col = accent_col or C_ACCENT
+    pw  = _pw()
+    sp  = ' ' * _pp()
+    acc = (' ' + col + '▍' + RESET) if use_accent else '  '
+    vis = vis_len(content)
+    pad = ' ' * max(0, pw - vis - 1)
+    print(sp + BG_PANEL + acc + BG_PANEL + content + pad + RESET)
+
+def _panel_sep():
+    pw = _pw()
+    sp = ' ' * _pp()
+    print(sp + BG_PANEL + ' ' + C_DIM_C + '▍' + RESET +
+          BG_PANEL + C_DIM_C + '─' * (pw - 1) + RESET)
+
+def _panel_blank(dim=False):
+    col = C_DIM_C if dim else C_ACCENT
+    _panel_row(use_accent=True, accent_col=col)
+
+def _model_row(model_name):
+    content = (f' {DIM}{C_GRAY}agent{RESET}{BG_PANEL}   '
+               f'{C_ACCENT}{BOLD}{model_name}{RESET}{BG_PANEL}   '
+               f'{DIM}{C_GRAY}openmodel{RESET}')
+    _panel_row(content, use_accent=False)
+
+def _hints_line():
+    W  = tw()
+    pw = _pw()
+    pp = _pp()
+    h  = (f'{DIM}{C_GRAY}tab{RESET} {C_GRAY}help'
+          f'   {DIM}{C_GRAY}new{RESET} {C_GRAY}chat'
+          f'   {DIM}{C_GRAY}exit{RESET} {C_GRAY}quit{RESET}')
+    hv  = vis_len(h)
+    # right-align to match panel right edge
+    pad = pp + pw + 2 - hv
+    print(' ' * max(0, pad) + h)
+
+# ─── Status bar ───────────────────────────────────────────────────────────────
+def print_status_bar(model_name, api_ok, msg_count=0):
+    W    = tw()
+    cwd  = os.getcwd().replace(str(Path.home()), '~')
+    dot  = (C_GREEN if api_ok else C_RED) + '●' + RESET
+    mdl  = DIM + C_GRAY + model_name + RESET
+    msgs = (DIM + C_GRAY + f'  {msg_count} msg{"s" if msg_count != 1 else ""}' + RESET) if msg_count else ''
+    left  = BG_STATUS + f'  {DIM}{C_GRAY}{cwd}{RESET}{BG_STATUS}  {dot}  {mdl}{msgs} '
+    right = BG_STATUS + f' {DIM}{C_GRAY}{VERSION}{RESET}{BG_STATUS}  '
+    gap   = W - vis_len(left) - vis_len(right)
+    print(left + ' ' * max(0, gap) + right + RESET)
+
+# ─── Home screen ──────────────────────────────────────────────────────────────
+def render_home(model_name, api_ok):
+    clear_screen()
+    print_logo()
+    _hints_line()
+    print()
+    print_status_bar(model_name, api_ok)
+    print()
+
+# ─── Interactive input panel ──────────────────────────────────────────────────
+def read_input(model_name):
+    pw = _pw()
+    pp = _pp()
+    sp = ' ' * pp
+
+    # Draw 3 rows upfront so all are same width
+    # Row 1 - top bar
+    _panel_blank(dim=True)
+    # Row 2 - input row: full dark bg, dim accent marker (repainted below)
+    print(sp + BG_PANEL + ' ' + C_DIM_C + '▍' + RESET +
+          BG_PANEL + ' ' * (pw - 1) + RESET)
+    # Row 3 - bottom bar (same width)
+    _panel_blank(dim=True)
+
+    # Reposition cursor to row 2 for actual input
+    sys.stdout.write('\033[2A\r')   # up 2 rows, col 0
+    active_prefix = sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET + BG_PANEL + C_ACCENT + '  '
+    sys.stdout.write(active_prefix)
+    sys.stdout.flush()
+
+    user_input = input()   # on Enter cursor lands at start of row 3
+
+    # Overwrite row 3 with separator, render footer below
+    sys.stdout.write('\r')
+    _panel_sep()
+    _model_row(model_name)
+    _panel_blank(dim=True)
+    print()
+    _hints_line()
+    print()
+    return user_input.strip()
+
+# ─── Spinner ──────────────────────────────────────────────────────────────────
+class Spinner:
+    FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+    def __init__(self, label='Thinking'):
+        self.label   = label
+        self._stop   = threading.Event()
+        self._thread = None
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            f    = self.FRAMES[i % len(self.FRAMES)]
+            line = f'\r  {C_ACCENT2}{f}{RESET}  {DIM}{C_GRAY}{self.label}...{RESET}   '
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            time.sleep(0.08)
+            i += 1
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+        sys.stdout.write('\r' + ' ' * 50 + '\r')
+        sys.stdout.flush()
+
+# ─── Message display ──────────────────────────────────────────────────────────
+def _msg_header(label, color, ts=None):
+    W   = tw()
+    ts_str = f'  {DIM}{C_GRAY}{ts}{RESET}' if ts else ''
+    hdr = f'  {color}{BOLD}{label}{RESET}{ts_str}'
+    hv  = vis_len(hdr)
+    print(hdr + '  ' + C_DIM_C + '─' * max(0, W - hv - 2) + RESET)
+
+def print_user_msg(text, nickname='You'):
+    now = datetime.now().strftime('%H:%M')
+    print()
+    _msg_header(nickname, C_ACCENT, now)
+    print()
+    W = tw()
+    width = min(W - 8, 96)
+    for line in text.split('\n'):
+        if not line.strip():
+            print()
+            continue
+        for row in textwrap.wrap(line, width) or ['']:
+            print(f'    {C_WHITE}{row}{RESET}')
+    print()
+
+def _ai_header(model_name_str):
+    print()
+    _msg_header(f'AI  ·  {model_name_str}', C_ACCENT2)
+    print()
+
+# ─── Markdown renderer ────────────────────────────────────────────────────────
+def render_inline(line):
+    line = re.sub(r'\*\*(.+?)\*\*', lambda m: BOLD + C_WHITE + m.group(1) + RESET + C_WHITE, line)
+    line = re.sub(r'\*(.+?)\*',     lambda m: ITALIC + m.group(1) + RESET + C_WHITE, line)
+    line = re.sub(r'`([^`]+)`',
+                  lambda m: BG_CODE + C_TEAL + ' ' + m.group(1) + ' ' + RESET + C_WHITE,
+                  line)
+    return line
+
+def print_ai_response(text):
+    W     = tw()
+    width = min(W - 8, 96)
     lines = text.split('\n')
-    max_len = max([len(line) for line in lines] + [1])
-    result = []
-    for line in lines:
-        colored_line = ""
-        for i, char in enumerate(line):
-            ratio = i / (max_len - 1) if max_len > 1 else 0
-            r = int(start_rgb[0] * (1 - ratio) + end_rgb[0] * ratio)
-            g = int(start_rgb[1] * (1 - ratio) + end_rgb[1] * ratio)
-            b = int(start_rgb[2] * (1 - ratio) + end_rgb[2] * ratio)
-            colored_line += f"\033[38;2;{r};{g};{b}m{char}"
-        colored_line += "\033[0m"
-        result.append(colored_line)
-    return '\n'.join(result)
+    in_code, lang, code_buf = False, '', []
 
-print(get_gradient_text(ascii_art))
+    def flush_code():
+        nonlocal code_buf, lang
+        if not code_buf:
+            return
+        cw  = width
+        hdr = f'  {lang if lang else "code"} '
+        print('    ' + BG_CODE + C_TEAL + BOLD + hdr + ' ' * max(0, cw - len(hdr) + 2) + RESET)
+        for cl in code_buf:
+            print('    ' + BG_CODE + C_TEAL + '  ' + cl + ' ' * max(0, cw - len(cl)) + RESET)
+        print('    ' + BG_CODE + ' ' * (cw + 2) + RESET)
+        code_buf.clear()
+        lang = ''
 
-CONFIG_DB = "config.db"
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith('```'):
+            if not in_code:
+                in_code = True
+                lang    = line[3:].strip()
+            else:
+                in_code = False
+                flush_code()
+            i += 1
+            continue
+        if in_code:
+            code_buf.append(line)
+            i += 1
+            continue
+        h = re.match(r'^(#{1,3})\s+(.*)', line)
+        if h:
+            col = [C_ACCENT, C_ACCENT2, C_TEAL][min(len(h.group(1)) - 1, 2)]
+            print(f'\n    {BOLD}{col}{h.group(2)}{RESET}')
+            i += 1
+            continue
+        if re.match(r'^[-─]{3,}$', line.strip()):
+            print('    ' + C_DIM_C + '─' * width + RESET)
+            i += 1
+            continue
+        bul = re.match(r'^(\s*)([-*•]|\d+\.)\s+(.*)', line)
+        if bul:
+            indent = len(bul.group(1))
+            marker = bul.group(2)
+            rest   = bul.group(3)
+            pfx    = (f'    {"  " * (indent // 2)}{C_ACCENT}{marker}{RESET} '
+                      if re.match(r'\d+\.', marker)
+                      else f'    {"  " * (indent // 2)}{C_ACCENT}▸{RESET} ')
+            pv = vis_len(pfx)
+            for j, wl in enumerate(textwrap.wrap(rest, width - pv + 4) or ['']):
+                print((pfx if j == 0 else ' ' * pv) + C_WHITE + render_inline(wl) + RESET)
+            i += 1
+            continue
+        if not line.strip():
+            print()
+        else:
+            for row in textwrap.wrap(line, width) or ['']:
+                print(f'    {C_WHITE}{render_inline(row)}{RESET}')
+        i += 1
+    if in_code and code_buf:
+        flush_code()
+
+# ─── Streaming printer ────────────────────────────────────────────────────────
+def print_ai_stream(generator, mdl):
+    spinner = Spinner('Thinking')
+    spinner.start()
+    full = ''
+
+    for token in generator:
+        full += token
+
+    spinner.stop()
+
+    if full.strip():
+        _ai_header(mdl)
+        print()
+        print_ai_response(full)
+        print()
+    return full
+
+# ─── Config DB ────────────────────────────────────────────────────────────────
+CONFIG_DB = 'config.db'
 conn = sqlite3.connect(CONFIG_DB)
-c = conn.cursor()
+c    = conn.cursor()
 c.execute("""CREATE TABLE IF NOT EXISTS config (
                 id INTEGER PRIMARY KEY,
                 api_key TEXT,
@@ -54,40 +368,96 @@ c.execute("""CREATE TABLE IF NOT EXISTS config (
                 system_prompt TEXT DEFAULT ''
             )""")
 conn.commit()
-
-c.execute("SELECT api_key, model, nickname, system_prompt FROM config WHERE id=1")
+c.execute('SELECT api_key, model, nickname, system_prompt FROM config WHERE id=1')
 row = c.fetchone()
 
+# ─── Setup wizard ─────────────────────────────────────────────────────────────
+def setup_wizard():
+    clear_screen()
+    print('\n' * 3)
+    center_print(C_ACCENT + BOLD + 'OPENMODEL  —  First-time setup' + RESET)
+    center_print(DIM + C_GRAY + 'Takes less than a minute' + RESET)
+    print()
+    print(C_DIM_C + '─' * tw() + RESET)
+    print()
+
+    def ask(prompt_text, default=None):
+        dflt = f'{DIM}{C_GRAY} [{default}]{RESET}' if default else ''
+        sys.stdout.write(f'  {C_ACCENT}❯{RESET}  {C_WHITE}{prompt_text}{RESET}{dflt}\n'
+                         f'  {C_DIM_C}└─{RESET}  ')
+        sys.stdout.flush()
+        val = input().strip()
+        return val if val else (default or '')
+
+    def section(label):
+        print()
+        print(f'  {BOLD}{C_ACCENT}{label}{RESET}')
+        print(f'  {C_DIM_C}{"─" * 44}{RESET}')
+
+    section('OPENROUTER API KEY')
+    print(f'  {DIM}{C_GRAY}Get yours at: https://openrouter.ai/keys{RESET}\n')
+
+    api_key = ask('Paste your API key')
+    while not api_key:
+        print(C_RED + '  ✗  API key cannot be empty.' + RESET)
+        api_key = ask('Paste your API key')
+
+    # Show the key back to the user (as requested)
+    preview = api_key[:8] + '·' * min(12, max(0, len(api_key) - 12)) + api_key[-4:]
+    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Key saved:{RESET}  {C_ACCENT}{preview}{RESET}')
+
+    section('MODEL')
+    examples = [
+        ('openai/gpt-4o-mini',                'fast & cheap (default)'),
+        ('anthropic/claude-3-haiku',           'smart & concise'),
+        ('deepseek/deepseek-r1',               'reasoning'),
+        ('meta-llama/llama-3.1-70b-instruct',  'open-source'),
+    ]
+    print()
+    for ex, note in examples:
+        print(f'  {C_DIM_C}·{RESET}  {C_ACCENT}{ex:<44}{RESET}{DIM}{C_GRAY}{note}{RESET}')
+    print()
+    model_name = ask('Model name', default='openai/gpt-4o-mini')
+
+    section('NICKNAME')
+    nickname = ask('Your nickname', default='user')
+
+    section('SYSTEM PROMPT')
+    print(f'  {DIM}{C_GRAY}Sent before every message. Leave blank for default.{RESET}\n')
+    use_sys = ask('Use a custom system prompt? (y/n)', default='n').lower()
+    system_prompt = ''
+    if use_sys in ('y', 'yes', '1'):
+        print(f'  {DIM}{C_GRAY}Type your prompt, press Enter twice to finish.{RESET}\n')
+        buf = []
+        while True:
+            ln = input('  ')
+            if ln == '' and buf and buf[-1] == '':
+                break
+            buf.append(ln)
+        system_prompt = '\n'.join(buf).strip()
+
+    print()
+    print(C_DIM_C + '─' * tw() + RESET)
+    print(f'\n  {C_GREEN}✓{RESET}  {C_WHITE}Setup complete! Starting OPENMODEL...{RESET}\n')
+    time.sleep(1)
+
+    c.execute(
+        'INSERT INTO config (id, api_key, model, nickname, system_prompt) VALUES (1,?,?,?,?)',
+        (api_key, model_name, nickname, system_prompt)
+    )
+    conn.commit()
+    return api_key, model_name, nickname, system_prompt
+
+# ─── Load or run setup ────────────────────────────────────────────────────────
 if row:
     api_key, model_name, nickname, system_prompt = row
 else:
-    api_key = input(get_gradient_text("give please openrouter api key: ") + "\033[0m").strip()
-    model_name = input(get_gradient_text("give please model(example: openai/gpt-4o-mini): ") + "\033[0m").strip()
-    nickname = input(get_gradient_text("give please your nickname: ") + "\033[0m").strip()
-    print(get_gradient_text("\n[SYSTEM PROMPT]"))
-    print(get_gradient_text("Enter a custom system prompt for AI (press Enter to skip - prompt will be empty):"))
-    system_prompt = input(get_gradient_text("> ") + "\033[0m").strip()
+    api_key, model_name, nickname, system_prompt = setup_wizard()
 
-    c.execute("INSERT INTO config (id, api_key, model, nickname, system_prompt) VALUES (1, ?, ?, ?, ?)",
-              (api_key, model_name, nickname, system_prompt))
-    conn.commit()
-
-welcome_msg = f"""
-Welcome, {nickname}! Type 'exit' or press Ctrl+Z to quit. Use Ctrl+C to cancel AI response.
-
-author socials:
-GitHub: https://github.com/xw5yt
-TikTok: https://www.tiktok.com/@xw5yt
-Telegram: https://t.me/artist_xw5yt
-twitch: https://www.twitch.tv/xw5yt
-
-our motto: No limits. No restrictions. Just raw AI power inside your terminal.
-"""
-print(get_gradient_text(welcome_msg))
-
-CHATS_DB = "chats.db"
+# ─── Chat DB ──────────────────────────────────────────────────────────────────
+CHATS_DB = 'chats.db'
 chat_conn = sqlite3.connect(CHATS_DB)
-chat_c = chat_conn.cursor()
+chat_c    = chat_conn.cursor()
 chat_c.execute("""CREATE TABLE IF NOT EXISTS chats (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_input TEXT,
@@ -96,777 +466,350 @@ chat_c.execute("""CREATE TABLE IF NOT EXISTS chats (
                 )""")
 chat_conn.commit()
 
-def animate_response(text, is_ai=True):
-    if is_ai:
-        sys.stdout.write(get_gradient_text("AI: ", (255, 105, 180), (0, 255, 255)))
-        sys.stdout.write("\033[38;2;200;255;255m")
-    sys.stdout.flush()
-    for ch in text:
-        sys.stdout.write(ch)
-        sys.stdout.flush()
-        time.sleep(0.02)
-    if is_ai:
-        sys.stdout.write("\033[0m")
-    print()
-
-def check_api_available():
+# ─── API check ────────────────────────────────────────────────────────────────
+def check_api():
     import socket
     try:
-        socket.gethostbyname("openrouter.ai")
+        socket.setdefaulttimeout(3)
+        socket.gethostbyname('openrouter.ai')
         return True
     except:
         return False
 
-API_AVAILABLE = check_api_available()
+API_AVAILABLE = check_api()
 
-def get_desktop_path():
-    """Get the actual Desktop path, handling OneDrive and other variations."""
+# ─── OpenRouter streaming ─────────────────────────────────────────────────────
+DEFAULT_SYS = (
+    "You are a helpful AI assistant with full access to the user's computer. "
+    "When you need to run a shell command, wrap it in [CMD]command[/CMD] tags. "
+    "Use %DESKTOP% for the Desktop path. "
+    "Format responses with markdown: **bold**, *italic*, `code`, ```language\\ncode\\n```. "
+    "Always confirm before destructive actions."
+)
+
+def stream_openrouter(messages, extra_system=None):
+    if not API_AVAILABLE:
+        yield '[API UNAVAILABLE] Cannot reach openrouter.ai'
+        return
+    headers = {'Authorization': f'Bearer {api_key}',
+               'Content-Type': 'application/json',
+               'HTTP-Referer': 'https://openrouter.ai'}
+    sys_msg = extra_system or system_prompt or DEFAULT_SYS
+    payload = {'model': model_name,
+               'messages': [{'role': 'system', 'content': sys_msg}] + messages,
+               'stream': True}
     try:
+        with requests.post('https://openrouter.ai/api/v1/chat/completions',
+                           headers=headers, json=payload, stream=True, timeout=60) as resp:
+            resp.encoding = 'utf-8'
+            if resp.status_code != 200:
+                yield f'[API ERROR] HTTP {resp.status_code}: {resp.text[:300]}'
+                return
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or line.startswith(':'):
+                    continue
+                if line.startswith('data: '):
+                    line = line[6:]
+                if not line or line == '[DONE]':
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if 'choices' in data and data['choices']:
+                    content = data['choices'][0].get('delta', {}).get('content', '')
+                    if content:
+                        yield content
+    except Exception as e:
+        yield f'[API ERROR] {e}'
 
-        import winreg
+# ─── System command helpers ───────────────────────────────────────────────────
+def get_desktop():
+    if platform.system() == 'Windows':
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")
-            desktop, _ = winreg.QueryValueEx(key, "Desktop")
-            winreg.CloseKey(key)
-            if os.path.exists(desktop):
-                return desktop
-        except Exception:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders')
+            d, _ = winreg.QueryValueEx(k, 'Desktop')
+            winreg.CloseKey(k)
+            if os.path.exists(d):
+                return d
+        except:
             pass
-    except ImportError:
-        pass
-
-    from pathlib import Path
-    desktop = Path.home() / "Desktop"
-    if desktop.exists():
-        return str(desktop)
-
-    onedrive_desktop = Path.home() / "OneDrive" / "Desktop"
-    if onedrive_desktop.exists():
-        return str(onedrive_desktop)
-
-    return os.path.expandvars(r"%USERPROFILE%\Desktop")
+        for p in [Path.home() / 'Desktop', Path.home() / 'OneDrive' / 'Desktop']:
+            if p.exists():
+                return str(p)
+        return os.path.expandvars(r'%USERPROFILE%\Desktop')
+    return str(Path.home() / 'Desktop')
 
 def execute_command(cmd):
-    """Execute a system command and return output."""
+    cmd = cmd.replace('%DESKTOP%', get_desktop())
     try:
-        import subprocess
-
-        desktop_path = get_desktop_path()
-        print(f"[DEBUG] Replacing path in command...")
-        print(f"[DEBUG] Before: {cmd[:150]}")
-
-        cmd = cmd.replace("%DESKTOP%", desktop_path)
-        cmd = cmd.replace("%USERPROFILE%\\Desktop", desktop_path)
-        cmd = cmd.replace("%USERPROFILE%/Desktop", desktop_path)
-
-        print(f"[DEBUG] After:  {cmd[:150]}")
-
-        result = subprocess.run(
-            ["cmd.exe", "/c", cmd],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            encoding='utf-8',
-            env=os.environ.copy()
-        )
-        output = result.stdout.strip()
-        if result.stderr:
-            stderr = result.stderr.strip()
-            if stderr and "is not recognized" in stderr:
-
-                ps_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-                result = subprocess.run(
-                    [ps_path, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    encoding='utf-8',
-                    env=os.environ.copy()
-                )
-                output = result.stdout.strip()
-                if result.stderr:
-                    output += "\n" + result.stderr.strip()
-            else:
-                output += "\n" + stderr
-        return output if output else "[Command executed successfully]"
+        if platform.system() == 'Windows':
+            r = subprocess.run(['cmd.exe', '/c', cmd], capture_output=True, text=True,
+                               timeout=15, encoding='utf-8', errors='replace', env=os.environ.copy())
+        else:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                               timeout=15, encoding='utf-8', errors='replace')
+        out = r.stdout.strip()
+        err = r.stderr.strip()
+        return (out + ('\n' + err if err else '')) or '[Command executed successfully]'
     except subprocess.TimeoutExpired:
-        return "Error: Command timed out"
+        return '[ERROR] Command timed out'
     except Exception as e:
-        return f"Error executing command: {e}"
+        return f'[ERROR] {e}'
 
-def process_ai_response(response):
-    """Extract and execute commands from AI response, return cleaned response."""
-    import re
+def confirm_exec(cmd):
+    print()
+    print(f'  {C_YELLOW}⚡  OPENMODEL wants to run:{RESET}')
+    print()
+    cw = min(tw() - 8, 80)
+    print('    ' + BG_CODE + C_TEAL + f'  {cmd:<{cw}}' + RESET)
+    print()
+    ans = input(f'  {C_YELLOW}Execute? (y/n):{RESET}  ').strip().lower()
+    return ans in ('y', 'yes', '1')
 
-    cmd_pattern = r'\[CMD\](.*?)\[/CMD\]'
-    commands = re.findall(cmd_pattern, response, re.DOTALL)
+# ─── File helpers ─────────────────────────────────────────────────────────────
+def detect_read(text):
+    for p in [
+        r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+['\"](.+?)['\"](?:\s+(?:и\s+)?(.+?))?$",
+        r"read\s+file\s+['\"](.+?)['\"](?:\s+and\s+(.+?))?$",
+        r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+([^\s]+)(?:\s+(?:и\s+)?(.+?))?$",
+        r"(?:read|analyze|explain)\s+(?:file\s+)?([^\s]+\.[\w]+)(?:\s+and\s+(.+?))?$",
+    ]:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip('"\''), (m.group(2).strip() if m.group(2) else None)
+    return None, None
 
-    results = []
-    for cmd in commands:
-        cmd = cmd.strip()
-        if cmd:
-            result = execute_command(cmd)
-            results.append(f"[Command executed: {cmd[:50]}...]\n{result}")
+def detect_modify(text):
+    m = re.search(r'(?:измени|modify|change|edit)\s+([^\s]+)\s+(.*)', text, re.IGNORECASE)
+    return (m.group(1).strip('"\''), m.group(2).strip()) if m else (None, None)
 
-    cleaned_response = re.sub(cmd_pattern, '', response, flags=re.DOTALL)
+# ─── Commands ─────────────────────────────────────────────────────────────────
+def show_help():
+    W = tw()
+    print()
+    label = f'  {C_ACCENT}{BOLD}COMMANDS{RESET}'
+    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
+    print()
+    cmds = [
+        ('exit / quit',           'Exit OPENMODEL'),
+        ('cls / clear',           'Back to home screen'),
+        ('new',                   'Fresh conversation (reset context)'),
+        ('model <name>',          'Switch AI model (saved to config)'),
+        ('history',               'Show last 10 conversations'),
+        ('config',                'Show current configuration'),
+        ('reset config',          'Delete config & re-run setup'),
+        ('read file <path>',      'Read & analyse a file with AI'),
+        ('modify <path> <task>',  'Ask AI to edit a file'),
+        ('tab / help / ?',        'Show this help'),
+    ]
+    ml = max(len(k) for k, _ in cmds)
+    for k, v in cmds:
+        print(f'  {C_ACCENT}{k:<{ml + 2}}{RESET}  {DIM}{C_GRAY}{v}{RESET}')
+    print()
 
-    return cleaned_response, results
-
-def execute_command(command):
-    """Execute a system command and return output."""
-    try:
-        import subprocess
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8')
-        output = result.stdout
-        if result.stderr:
-            output += result.stderr
-        return output.strip() if output else "[Command executed successfully]"
-    except Exception as e:
-        return f"[ERROR] {e}"
-
-def call_openrouter(prompt):
-
-    if not API_AVAILABLE:
-        return f"[API UNAVAILABLE] echo: {prompt}"
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    json_data = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": prompt}]
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=json_data, timeout=30)
-        if resp.status_code != 200:
-            return f"[API ERROR] Status {resp.status_code}: {resp.text}"
-
-        data = resp.json()
-
-        if "choices" in data and len(data["choices"]) > 0:
-            content = data["choices"][0]["message"].get("content", "")
-            if content:
-                return content
-        return "[API ERROR] Invalid response format"
-    except Exception as e:
-        return f"[API ERROR] {e}"
-
-def stream_openrouter(prompt):
-    """Generator yielding tokens as they arrive from OpenRouter using streaming.
-
-    Yields fragments (usually chunks of text) which should be printed immediately.
-    Falls back to non-streaming if streaming fails.
-    """
-    if not API_AVAILABLE:
-        yield f"[API UNAVAILABLE] echo: {prompt}"
+def show_history():
+    chat_c.execute('SELECT user_input, ai_response, timestamp FROM chats ORDER BY id DESC LIMIT 10')
+    rows = chat_c.fetchall()
+    if not rows:
+        print(f'\n  {C_GRAY}No history yet.{RESET}\n')
         return
+    W = tw()
+    print()
+    label = f'  {C_ACCENT}{BOLD}HISTORY{RESET}  {DIM}{C_GRAY}last 10{RESET}'
+    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
+    for u, a, ts in reversed(rows):
+        print()
+        print(f'  {DIM}{C_GRAY}{ts}{RESET}')
+        print(f'  {C_ACCENT}You:{RESET}  {C_WHITE}{u[:120]}{RESET}')
+        print(f'  {C_ACCENT2}AI: {RESET}  {C_GRAY}{(a or "")[:180].replace(chr(10), " ")}{RESET}')
+    print()
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://openrouter.ai"
-    }
+def show_config():
+    W = tw()
+    print()
+    label = f'  {C_ACCENT}{BOLD}CONFIG{RESET}'
+    print(label + '  ' + C_DIM_C + '─' * max(0, W - vis_len(label) - 2) + RESET)
+    print()
+    # Show full key so the user can see what they entered
+    key_disp = api_key
+    sp_prev  = (system_prompt[:72] + '…') if len(system_prompt) > 72 \
+               else (system_prompt or f'{DIM}{C_GRAY}(default){RESET}')
+    rows = [
+        ('API key',       key_disp),
+        ('Model',         model_name),
+        ('Nickname',      nickname),
+        ('System prompt', sp_prev),
+        ('API status',    (C_GREEN + '● online' if API_AVAILABLE else C_RED + '● offline') + RESET),
+    ]
+    ml = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f'  {C_GRAY}{k:<{ml + 2}}{RESET}  {C_WHITE}{v}{RESET}')
+    print()
 
-    if system_prompt:
-        system_msg = system_prompt
-    else:
-        system_msg = "You have full access to the user's computer and can execute commands. When you need to execute a command, wrap it in [CMD]command[/CMD] tags.\n\nImportant: Use %DESKTOP% placeholder for the user's Desktop path. It will be automatically replaced with the correct path on their system (works with OneDrive and other variations).\n\nExamples:\n- Create file: [CMD]echo. > %DESKTOP%\\test.txt[/CMD]\n- Create directory: [CMD]mkdir %DESKTOP%\\newfolder[/CMD]\n- Copy file: [CMD]copy file.txt %DESKTOP%\\[/CMD]\n- List files: [CMD]dir %DESKTOP%[/CMD]\n- Read file: [CMD]type %DESKTOP%\\test.txt[/CMD]\n\nAlways use %DESKTOP% for Desktop paths. Use cmd.exe style commands. The user has granted full system access."
+# ─── Main loop ────────────────────────────────────────────────────────────────
+def main():
+    global model_name, API_AVAILABLE
 
-    json_data = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_msg
-            },
-            {"role": "user", "content": prompt}
-        ],
-        "stream": True
-    }
+    conversation: list[dict] = []
+    msg_count = 0
 
-    try:
-        with requests.post(url, headers=headers, json=json_data, stream=True, timeout=30) as resp:
+    render_home(model_name, API_AVAILABLE)
 
-            resp.encoding = 'utf-8'
-
-            if resp.status_code != 200:
-
-                yield from _fallback_openrouter(prompt)
-                return
-
-            has_content = False
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or line.startswith(':'):
-                    continue
-                if line.startswith('data: '):
-                    line = line[6:]
-                if not line or line == '[DONE]':
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if "choices" in data and len(data["choices"]) > 0:
-                    choice = data["choices"][0]
-                    if "delta" in choice and "content" in choice["delta"]:
-                        content = choice["delta"]["content"]
-                        if content:
-                            has_content = True
-
-                            yield content
-
-            if not has_content:
-                yield "[API ERROR] No content received from stream"
-    except Exception as e:
-
-        yield from _fallback_openrouter(prompt)
-
-def _fallback_openrouter(prompt):
-    """Non-streaming fallback when streaming fails."""
-    try:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        if system_prompt:
-            system_msg = system_prompt
-        else:
-            system_msg = "You have full access to the user's computer and can execute commands. When you need to execute a command, wrap it in [CMD]command[/CMD] tags."
-
-        json_data = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt}
-            ]
-        }
-
-        resp = requests.post(url, headers=headers, json=json_data, timeout=30)
-        if resp.status_code != 200:
-            yield f"[API ERROR] Status {resp.status_code}: {resp.text}"
-            return
-
-        data = resp.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            content = data["choices"][0]["message"].get("content", "")
-            if content:
-                yield content
-            else:
-                yield "[API ERROR] Empty response from API"
-        else:
-            yield "[API ERROR] Invalid response format"
-    except Exception as e:
-        yield f"[API ERROR] {e}"
-
-def detect_file_modify_command(user_input):
-    """Detect and extract file modification commands like 'измени /путь/к/файлу prompt'"""
-    import re
-
-    pattern = r'(?:измени|modify|change|edit)\s+([^\s]+)\s+(.*)'
-    match = re.search(pattern, user_input, re.IGNORECASE)
-    if match:
-        file_path = match.group(1).strip('"\'')
-        prompt = match.group(2).strip()
-        return file_path, prompt
-    return None, None
-
-def detect_code_read_command(user_input):
-    """Detect commands like 'read file /path and write/explain/summarize what...' in English and Russian"""
-    import re
-
-    pattern_ru_quoted = r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+['\"](.+?)['\"](?:\s+(?:и\s+)?(.+?))?$"
-    match = re.search(pattern_ru_quoted, user_input, re.IGNORECASE)
-    if match:
-        file_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else None
-        return file_path, instruction
-
-    pattern_en_quoted = r"read\s+file\s+['\"](.+?)['\"](?:\s+and\s+(.+?))?$"
-    match = re.search(pattern_en_quoted, user_input, re.IGNORECASE)
-    if match:
-        file_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else None
-        return file_path, instruction
-
-    pattern_ru_unquoted = r"(?:прочитай|расскажи|объясни|проанализируй)\s+файл\s+([^\s]+)(?:\s+(?:и\s+)?(.+?))?$"
-    match = re.search(pattern_ru_unquoted, user_input, re.IGNORECASE)
-    if match:
-        potential_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else None
-
-        if '.' in potential_path or ':' in potential_path or '/' in potential_path:
-            return potential_path, instruction
-
-    pattern_en_unquoted = r"read\s+file\s+([^\s]+)(?:\s+and\s+(.+?))?$"
-    match = re.search(pattern_en_unquoted, user_input, re.IGNORECASE)
-    if match:
-        potential_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else None
-
-        if '.' in potential_path or ':' in potential_path or '/' in potential_path:
-            return potential_path, instruction
-
-    return None, None
-
-def detect_write_code_command(user_input):
-    """Detect commands like 'write code to file path' or 'напиши код в файл path' in English and Russian"""
-    import re
-
-    pattern_ru1 = r"(?:напиши|создай|сгенерируй)\s+(?:код\s+)?в\s+файл\s+['\"]?([^\s'\";,]+)['\"]?(?:\s+(.+?))?$"
-    match = re.search(pattern_ru1, user_input, re.IGNORECASE)
-    if match:
-        file_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else user_input.split(file_path)[-1].strip()
-        if instruction:
-            return file_path, instruction
-        else:
-            return file_path, "Write useful Python code"
-
-    pattern_en1 = r"write\s+(?:code\s+)?to\s+file\s+['\"]?([^\s'\";,]+)['\"]?(?:\s+(.+?))?$"
-    match = re.search(pattern_en1, user_input, re.IGNORECASE)
-    if match:
-        file_path = match.group(1).strip()
-        instruction = match.group(2).strip() if match.group(2) else "Write useful Python code"
-        return file_path, instruction
-
-    pattern_ru2 = r"(?:напиши|создай|сгенерируй)\s+(?:код\s+)?в\s+['\"]?([^\s'\";,]+)['\"]?(?:\s+(.+?))?$"
-    match = re.search(pattern_ru2, user_input, re.IGNORECASE)
-    if match:
-        potential_path = match.group(1).strip()
-
-        if '.' in potential_path:
-            instruction = match.group(2).strip() if match.group(2) else "Write useful Python code"
-            return potential_path, instruction
-
-    return None, None
-
-def confirm_command_execution(cmd):
-    """Ask user to confirm command execution with [Y/n] prompt."""
-    print(f"\n[COMMAND TO EXECUTE]\n{cmd}\n")
-    response = input("[Y/n] Execute this command? ").strip().lower()
-    return response != 'n'
-
-def stream_openrouter_with_system_msg(prompt, system_message=None):
-    """Generator yielding tokens as they arrive from OpenRouter using streaming with custom system message."""
-    if not API_AVAILABLE:
-        yield f"[API UNAVAILABLE] echo: {prompt}"
-        return
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://openrouter.ai"
-    }
-
-    if system_message:
-        system_msg = system_message
-    elif system_prompt:
-        system_msg = system_prompt
-    else:
-        system_msg = "You have full access to the user's computer and can execute commands. When you need to execute a command, wrap it in [CMD]command[/CMD] tags.\n\nImportant: Use %DESKTOP% placeholder for the user's Desktop path. It will be automatically replaced with the correct path on their system (works with OneDrive and other variations).\n\nExamples:\n- Create file: [CMD]echo. > %DESKTOP%\\test.txt[/CMD]\n- Create directory: [CMD]mkdir %DESKTOP%\\newfolder[/CMD]\n- Copy file: [CMD]copy file.txt %DESKTOP%\\[/CMD]\n- List files: [CMD]dir %DESKTOP%[/CMD]\n- Read file: [CMD]type %DESKTOP%\\test.txt[/CMD]\n\nAlways use %DESKTOP% for Desktop paths. Use cmd.exe style commands. The user has granted full system access."
-
-    json_data = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt}
-        ],
-        "stream": True
-    }
-
-    try:
-        with requests.post(url, headers=headers, json=json_data, stream=True, timeout=30) as resp:
-            resp.encoding = 'utf-8'
-
-            if resp.status_code != 200:
-                yield from _fallback_openrouter(prompt)
-                return
-
-            has_content = False
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or line.startswith(':'):
-                    continue
-                if line.startswith('data: '):
-                    line = line[6:]
-                if not line or line == '[DONE]':
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "choices" in data and len(data["choices"]) > 0:
-                    choice = data["choices"][0]
-                    if "delta" in choice and "content" in choice["delta"]:
-                        content = choice["delta"]["content"]
-                        if content:
-                            has_content = True
-                            try:
-                                yield content
-                            except UnicodeEncodeError:
-                                yield content.encode('utf-8', errors='replace').decode('utf-8')
-
-            if not has_content:
-                yield "[API ERROR] No content received from stream"
-    except Exception as e:
-        yield from _fallback_openrouter(prompt)
-
-while True:
-    try:
-        cwd = os.getcwd()
-        prompt_text = get_gradient_text(f"*{nickname}* {cwd} > ", (0, 255, 255), (255, 105, 180))
-        user_input = input(prompt_text + "\033[0m ").strip()
-
-        if user_input.lower() == "exit":
-            print(get_gradient_text("Exiting…"))
+    while True:
+        try:
+            user_input = read_input(model_name)
+        except (EOFError, KeyboardInterrupt):
+            print(f'\n\n  {DIM}{C_GRAY}Goodbye.{RESET}\n')
             break
 
-        if user_input.startswith("!"):
-            cmd = user_input[1:].strip()
-            if cmd == "ls":
-                try:
-                    files = os.listdir(cwd)
-                    animate_response(" ".join(files), is_ai=False)
-                except Exception as e:
-                    animate_response(f"Error listing files: {e}", is_ai=False)
-            elif cmd == "clear":
-                if platform.system() == "Windows":
-                    os.system("cls")
-                else:
-                    os.system("clear")
-            elif cmd.startswith("cd "):
-                path = cmd[3:].strip()
-                try:
-                    os.chdir(Path(cwd) / path)
-                    animate_response(f"Changed directory to {os.getcwd()}", is_ai=False)
-                except Exception as e:
-                    animate_response(f"Error: {e}", is_ai=False)
-            elif cmd.startswith("python "):
-                python_file = cmd[7:].strip().strip('"\'')
-                try:
+        if not user_input:
+            continue
 
-                    env = os.environ.copy()
-                    env['PYTHONIOENCODING'] = 'utf-8'
-                    result = subprocess.run(
-                        ["python", python_file],
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8',
-                        env=env,
-                        timeout=30
-                    )
-                    output = result.stdout
-                    if result.stderr:
-                        output += result.stderr
-                    print(f"\n[OUTPUT]\n{output}\n" if output else "\n[Command executed successfully]\n")
-                except subprocess.TimeoutExpired:
-                    animate_response("Error: Command timed out", is_ai=False)
-                except Exception as e:
-                    animate_response(f"Error executing Python file: {e}", is_ai=False)
+        lower = user_input.lower()
+
+        if lower in ('exit', 'quit', 'q'):
+            print(f'\n  {DIM}{C_GRAY}Goodbye.{RESET}\n')
+            break
+
+        if lower in ('cls', 'clear'):
+            render_home(model_name, API_AVAILABLE)
+            continue
+
+        if lower == 'new':
+            conversation.clear()
+            msg_count = 0
+            render_home(model_name, API_AVAILABLE)
+            print()
+            center_print(C_GREEN + '✓  New conversation started' + RESET)
+            print()
+            continue
+
+        if lower in ('tab', 'help', '?'):
+            show_help()
+            continue
+
+        if lower == 'history':
+            show_history()
+            continue
+
+        if lower == 'config':
+            show_config()
+            continue
+
+        if lower == 'reset config':
+            c.execute('DELETE FROM config WHERE id=1')
+            conn.commit()
+            print(f'\n  {C_YELLOW}Config deleted. Restart to re-run setup.{RESET}\n')
+            time.sleep(1.5)
+            break
+
+        if lower.startswith('model '):
+            nm = user_input[6:].strip()
+            if nm:
+                model_name = nm
+                c.execute('UPDATE config SET model=? WHERE id=1', (model_name,))
+                conn.commit()
+                print(f'\n  {C_GREEN}✓{RESET}  Model → {C_ACCENT}{model_name}{RESET}\n')
             else:
-                animate_response(f"command not found: {cmd}", is_ai=False)
-        else:
-            try:
-
-                write_code_file, write_code_instruction = detect_write_code_command(user_input)
-
-                if write_code_file and write_code_instruction:
-
-                    try:
-
-                        if not os.path.isabs(write_code_file):
-                            write_code_file = os.path.join(cwd, write_code_file)
-
-                        code_generation_prompt = f"""You are a Python code generator. The user wants you to write Python code.
-
-User's Request: {write_code_instruction}
-
-IMPORTANT INSTRUCTIONS:
-1. Write ONLY Python code - nothing else
-2. Do NOT use any command tags like [CMD], [/CMD], echo, or similar
-3. Do NOT include markdown formatting or code blocks (```)
-4. Do NOT explain what the code does
-5. Do NOT suggest running commands
-6. Start with the code immediately
-7. The code will be automatically saved to a file, just provide the pure Python code
-
-Now write the Python code:
-"""
-
-                        print(f"\nGenerating code for: {write_code_file}\n")
-                        animate_response("…generating code…")
-                        sys.stdout.write(get_gradient_text("AI: ", (255, 105, 180), (0, 255, 255)))
-                        sys.stdout.flush()
-                        sys.stdout.write("\033[38;2;200;255;255m")
-                        generated_code = ""
-
-                        code_gen_system_msg = """You are a Python expert code generator.
-Your task is to generate clean, working Python code based on user requirements.
-
-CRITICAL RULES:
-- Output ONLY the code itself - no explanations, comments about what you're doing, or markdown formatting
-- Do NOT use [CMD], [/CMD], echo, or any command tags
-- Do NOT suggest running commands
-- Just the pure Python code that can be directly executed
-- Start with the code immediately, no preamble"""
-
-                        for token in stream_openrouter_with_system_msg(code_generation_prompt, code_gen_system_msg):
-
-                            try:
-                                sys.stdout.write(token)
-                                sys.stdout.flush()
-                            except UnicodeEncodeError:
-                                sys.stdout.buffer.write(token.encode('utf-8', errors='replace'))
-                                sys.stdout.buffer.flush()
-                            generated_code += token
-                        print("\033[0m\n")
-
-                        import re
-                        generated_code_clean = re.sub(r'\[CMD\].*?\[/CMD\]', '', generated_code, flags=re.DOTALL)
-
-                        generated_code_clean = re.sub(r'```(?:python)?\n?', '', generated_code_clean)
-                        generated_code_clean = generated_code_clean.strip()
-
-                        utf8_header = "# -*- coding: utf-8 -*-\nimport sys\nif sys.platform == 'win32':\n    import io\n    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\n\n"
-                        generated_code_final = utf8_header + generated_code_clean
-
-                        os.makedirs(os.path.dirname(write_code_file) if os.path.dirname(write_code_file) else ".", exist_ok=True)
-                        with open(write_code_file, 'w', encoding='utf-8') as f:
-                            f.write(generated_code_final)
-
-                        print(f"✓ Code saved to: {write_code_file}\n")
-
-                        chat_c.execute("INSERT INTO chats (user_input, ai_response) VALUES (?, ?)",
-                                       (user_input, f"Code generated and saved to {write_code_file}"))
-                        chat_conn.commit()
-
-                    except Exception as e:
-                        animate_response(f"Error generating code: {e}", is_ai=False)
-
-                elif True:
-                    code_file, read_instruction = detect_code_read_command(user_input)
-
-                if code_file:
-
-                    try:
-                        with open(code_file, 'r', encoding='utf-8') as f:
-                            file_content = f.read()
-
-                        if read_instruction:
-                            instruction = read_instruction
-                        else:
-                            instruction = "Analyze and explain this content in detail"
-
-                        analysis_prompt = f"""IMPORTANT: The file content is provided below. Do NOT use [CMD] or any commands.
-
-User's Request: {instruction}
-
-File Path: {code_file}
-
-File Content:
-================
-{file_content}
-================
-
-Now respond to the user's request based on the content above. Provide a clear, direct answer."""
-
-                        print(f"\nReading: {code_file}\n")
-                        animate_response("…analyzing…")
-                        sys.stdout.write(get_gradient_text("AI: ", (255, 105, 180), (0, 255, 255)))
-                        sys.stdout.flush()
-                        sys.stdout.write("\033[38;2;200;255;255m")
-                        ai_answer = ""
-
-                        analysis_system_msg = """You are a file analysis assistant.
-The user has provided you with file content and asked you to analyze it.
-The file content is embedded in the conversation - it is already available to you.
-
-CRITICAL RULES:
-- Do NOT use [CMD], [/CMD], or any command tags
-- Do NOT suggest executing commands
-- Do NOT output [OUTPUT] or any technical markers
-- Only provide analysis and answer the user's specific request
-- Be direct and concise"""
-
-                        for token in stream_openrouter_with_system_msg(analysis_prompt, analysis_system_msg):
-
-                            filtered_token = token
-                            if '[CMD]' not in filtered_token and '[/CMD]' not in filtered_token and \
-                               '[OUTPUT]' not in filtered_token and '[/OUTPUT]' not in filtered_token:
-                                try:
-                                    sys.stdout.write(filtered_token)
-                                    sys.stdout.flush()
-                                except UnicodeEncodeError:
-                                    sys.stdout.buffer.write(filtered_token.encode('utf-8', errors='replace'))
-                                    sys.stdout.buffer.flush()
-                            ai_answer += token
-                        print("\033[0m\n")
-
-                        chat_c.execute("INSERT INTO chats (user_input, ai_response) VALUES (?, ?)",
-                                       (user_input, ai_answer))
-                        chat_conn.commit()
-
-                    except FileNotFoundError:
-                        animate_response(f"Error: File not found - {code_file}", is_ai=False)
-                    except Exception as e:
-                        animate_response(f"Error reading file: {e}", is_ai=False)
-
-                else:
-                    file_path, modify_prompt = detect_file_modify_command(user_input)
-
-                    if file_path and modify_prompt:
-
-                        try:
-
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                file_content = f.read()
-
-                            file_dir = os.path.dirname(os.path.abspath(file_path))
-
-                            enhanced_prompt = f"""You are a code modification expert. The user wants you to modify a file.
-
-FILE PATH: {file_path}
-FILE DIRECTORY: {file_dir}
-
-ORIGINAL FILE CONTENT:
-```
-{file_content}
-
-```
-
-USER REQUEST: {modify_prompt}
-
-INSTRUCTIONS:
-1. Understand what changes are needed
-2. Return the COMPLETE modified file content wrapped in [MODIFIED_FILE]...[/MODIFIED_FILE] tags
-3. If you need to create new files in the same directory, wrap them in [NEW_FILE path]...[/NEW_FILE] tags
-4. If you need to execute system commands (like installing packages, running scripts), wrap them in [CMD]command[/CMD] tags
-5. For each [CMD] command, provide a brief explanation before it
-6. Do NOT use [CMD] tags for basic file operations - use [MODIFIED_FILE] and [NEW_FILE] instead
-
-Return the modified file and any new files needed."""
-
-                            print("Reading file and processing modification request...\n")
-                            animate_response("…generating response…")
-                            sys.stdout.write(get_gradient_text("AI: ", (255, 105, 180), (0, 255, 255)))
-                            sys.stdout.flush()
-                            sys.stdout.write("\033[38;2;200;255;255m")
-                            ai_answer = ""
-                            for token in stream_openrouter_with_system_msg(enhanced_prompt):
-                                try:
-                                    sys.stdout.write(token)
-                                    sys.stdout.flush()
-                                except UnicodeEncodeError:
-                                    sys.stdout.buffer.write(token.encode('utf-8', errors='replace'))
-                                    sys.stdout.buffer.flush()
-                                ai_answer += token
-                            print("\033[0m\n")
-
-                            import re
-                            modified_file_match = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', ai_answer, re.DOTALL)
-                            if modified_file_match:
-                                modified_content = modified_file_match.group(1).strip()
-                                print(f"\n[APPLYING CHANGES TO] {file_path}")
-                                with open(file_path, 'w', encoding='utf-8') as f:
-                                    f.write(modified_content)
-                                print(f"✓ File updated successfully\n")
-
-                            new_files = re.findall(r'\[NEW_FILE\s+([^\]]+)\](.*?)\[/NEW_FILE\]', ai_answer, re.DOTALL)
-                            for new_file_path, new_content in new_files:
-                                new_file_path = new_file_path.strip()
-                                new_content = new_content.strip()
-
-                                if not os.path.isabs(new_file_path):
-                                    new_file_path = os.path.join(file_dir, new_file_path)
-
-                                print(f"\n[CREATING NEW FILE] {new_file_path}")
-                                os.makedirs(os.path.dirname(new_file_path), exist_ok=True)
-                                with open(new_file_path, 'w', encoding='utf-8') as f:
-                                    f.write(new_content)
-                                print(f"✓ File created successfully\n")
-
-                            commands = re.findall(r'\[CMD\](.*?)\[/CMD\]', ai_answer, re.DOTALL)
-                            for cmd in commands:
-                                cmd = cmd.strip()
-                                if cmd:
-
-                                    if confirm_command_execution(cmd):
-                                        desktop_path = get_desktop_path()
-                                        cmd = cmd.replace("%DESKTOP%", desktop_path)
-                                        cmd = cmd.replace("%USERPROFILE%\\Desktop", desktop_path)
-                                        cmd = cmd.replace("%USERPROFILE%/Desktop", desktop_path)
-                                        result = execute_command(cmd)
-                                        print(f"[OUTPUT]\n{result}\n")
-                                    else:
-                                        print("[Command execution skipped by user]\n")
-
-                            chat_c.execute("INSERT INTO chats (user_input, ai_response) VALUES (?, ?)",
-                                           (user_input, ai_answer))
-                            chat_conn.commit()
-
-                        except FileNotFoundError:
-                            animate_response(f"Error: File not found - {file_path}", is_ai=False)
-                        except Exception as e:
-                            animate_response(f"Error processing file: {e}", is_ai=False)
-
-                    else:
-
-                        animate_response("…generating response…")
-
-                        sys.stdout.write(get_gradient_text("AI: ", (255, 105, 180), (0, 255, 255)))
-                        sys.stdout.flush()
-                        sys.stdout.write("\033[38;2;200;255;255m")
-                        ai_answer = ""
-                        for token in stream_openrouter(user_input):
-
-                            try:
-                                sys.stdout.write(token)
-                                sys.stdout.flush()
-                            except UnicodeEncodeError:
-
-                                sys.stdout.buffer.write(token.encode('utf-8', errors='replace'))
-                                sys.stdout.buffer.flush()
-                            ai_answer += token
-                        print()
-
-                        import re
-                        commands = re.findall(r'\[CMD\](.*?)\[/CMD\]', ai_answer, re.DOTALL)
-                        for cmd in commands:
-                            cmd = cmd.strip()
-                            if cmd:
-
-                                if confirm_command_execution(cmd):
-                                    desktop_path = get_desktop_path()
-                                    cmd = cmd.replace("%DESKTOP%", desktop_path)
-                                    cmd = cmd.replace("%USERPROFILE%\\Desktop", desktop_path)
-                                    cmd = cmd.replace("%USERPROFILE%/Desktop", desktop_path)
-                                    result = execute_command(cmd)
-                                    print(f"[OUTPUT]\n{result}\n")
-                                else:
-                                    print("[Command execution skipped by user]\n")
-
-                        chat_c.execute("INSERT INTO chats (user_input, ai_response) VALUES (?, ?)",
-                                       (user_input, ai_answer))
-                        chat_conn.commit()
-            except KeyboardInterrupt:
-                print("\nCancelled")
+                print(f'\n  {C_RED}Usage: model <model-name>{RESET}\n')
+            continue
+
+        # ── File read ──────────────────────────────────────────────────────────
+        fp, inst = detect_read(user_input)
+        if fp:
+            if not os.path.exists(fp):
+                print(f'\n  {C_RED}✗  File not found: {fp}{RESET}\n')
                 continue
+            print_user_msg(user_input, nickname)
+            try:
+                content = open(fp, encoding='utf-8', errors='replace').read()
+                task    = inst or 'Summarize this file and explain what it does.'
+                sys_m   = ('You are a code analysis assistant. '
+                           'Use clear markdown formatting. No [CMD] tags.')
+                prompt  = f'FILE PATH: {fp}\n\nCONTENT:\n```\n{content}\n```\n\nTASK: {task}'
+                full    = print_ai_stream(
+                    stream_openrouter([{'role': 'user', 'content': prompt}], extra_system=sys_m),
+                    model_name)
+                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
+                               (user_input, full))
+                chat_conn.commit()
+            except Exception as e:
+                print(f'\n  {C_RED}Error: {e}{RESET}\n')
+            continue
 
-    except EOFError:
-        print("\nExiting…")
-        break
-    except KeyboardInterrupt:
-        print("\nExiting…")
-        break
+        # ── File modify ────────────────────────────────────────────────────────
+        mfp, mtask = detect_modify(user_input)
+        if mfp and mtask:
+            if not os.path.exists(mfp):
+                print(f'\n  {C_RED}✗  File not found: {mfp}{RESET}\n')
+                continue
+            print_user_msg(user_input, nickname)
+            try:
+                orig   = open(mfp, encoding='utf-8', errors='replace').read()
+                prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
+                          f'REQUEST: {mtask}\n\n'
+                          'Modified file → [MODIFIED_FILE]...[/MODIFIED_FILE]\n'
+                          'New file → [NEW_FILE path]...[/NEW_FILE]\n'
+                          'Shell cmd → [CMD]cmd[/CMD]')
+                full = print_ai_stream(
+                    stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
+                m = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
+                if m:
+                    open(mfp, 'w', encoding='utf-8').write(m.group(1).strip())
+                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
+                for nfp, nc in re.findall(r'\[NEW_FILE\s+([^\]]+)\](.*?)\[/NEW_FILE\]', full, re.DOTALL):
+                    nfp = nfp.strip()
+                    if not os.path.isabs(nfp):
+                        nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
+                    os.makedirs(os.path.dirname(nfp), exist_ok=True)
+                    open(nfp, 'w', encoding='utf-8').write(nc.strip())
+                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
+                for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
+                    cmd = cmd.strip()
+                    if cmd and confirm_exec(cmd):
+                        out = execute_command(cmd)
+                        print(f'\n    {C_GRAY}{out}{RESET}\n')
+                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
+                               (user_input, full))
+                chat_conn.commit()
+            except Exception as e:
+                print(f'\n  {C_RED}Error: {e}{RESET}\n')
+            continue
 
-conn.close()
-chat_conn.close()
+        # ── Normal multi-turn chat ─────────────────────────────────────────────
+        print_user_msg(user_input, nickname)
+        conversation.append({'role': 'user', 'content': user_input})
+        msg_count += 1
 
+        full = ''
+        try:
+            full = print_ai_stream(stream_openrouter(conversation), model_name)
+        except KeyboardInterrupt:
+            print(f'\n  {C_GRAY}[Cancelled]{RESET}\n')
+            conversation.pop()
+            msg_count -= 1
+            continue
+
+        if full:
+            conversation.append({'role': 'assistant', 'content': full})
+
+        for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
+            cmd = cmd.strip()
+            if cmd and confirm_exec(cmd):
+                out = execute_command(cmd)
+                print(f'\n    {C_GRAY}{out}{RESET}\n')
+
+        chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
+                       (user_input, full))
+        chat_conn.commit()
+        print_status_bar(model_name, API_AVAILABLE, msg_count)
+        print()
+
+    conn.close()
+    chat_conn.close()
+
+if __name__ == '__main__':
+    main()
