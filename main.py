@@ -64,6 +64,19 @@ def clear_screen():
     sys.stdout.write('\033[3J\033[2J\033[H')
     sys.stdout.flush()
 
+def clean_content(text):
+    text = text.strip()
+    m = re.match(r'^```[a-zA-Z0-9]*\n(.*?)```$', text, re.DOTALL)
+    if m:
+        return m.group(1).rstrip()
+    return text
+
+def clean_path(path):
+    path = path.strip(" \t\r\n\"'`")
+    # Remove some extremely invalid chars for windows paths if accidentally generated
+    return re.sub(r'[*?<>|]', '', path)
+
+
 # ─── Logo ─────────────────────────────────────────────────────────────────────
 LOGO_BIG = [
     " ██████╗ ██████╗ ███████╗███╗   ██╗███╗   ███╗ ██████╗ ██████╗ ███████╗██╗     ",
@@ -539,8 +552,9 @@ DEFAULT_SYS = (
     "To modify an existing file, use EXACTLY this format:\n"
     "[EDIT_FILE: path/to/file]\n...full new content...\n[/EDIT_FILE]\n"
     "Directories are created automatically, do NOT use [CMD] mkdir.\n"
-    "Do NOT wrap file content in markdown code blocks.\n"
-    "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files for transferring code. If you create temp files, delete them with [CMD]del path[/CMD] when done.\n"
+    "Do NOT wrap file content in markdown code blocks. NO ```python, NO ```!\n"
+    "Write the RAW file content directly inside the tags.\n"
+    "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files.\n"
     "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
     "You will receive the command output in the next message. Reading commands (type, dir) execute silently in the background.\n"
     "Note: The shell is Windows CMD. Do NOT use `cat`, use `type`. "
@@ -857,7 +871,7 @@ def main():
                 "To create a file, you MUST use exactly this format:\n"
                 "[NEW_FILE: path/relative/to/project]\n...content...\n[/NEW_FILE]\n"
                 "Directories are created automatically, do NOT use [CMD] mkdir.\n"
-                "Do NOT wrap the file content in markdown code blocks.\n"
+                "Do NOT wrap the file content in markdown code blocks. Use RAW text only!\n"
                 "For every shell command to run (install deps, init git, etc.), use [CMD]command[/CMD]. "
                 "In [CMD] blocks, use paths relative to the project directory or absolute paths. "
                 "Do NOT ask clarifying questions — implement everything described. "
@@ -881,11 +895,11 @@ def main():
                 # ── Auto-create files (no confirmation needed) ─────────────
                 for rel_path, content in re.findall(
                         r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
-                    rel_path = rel_path.strip().replace('%DESKTOP%', get_desktop())
+                    rel_path = clean_path(rel_path.replace('%DESKTOP%', get_desktop()))
                     abs_path = (rel_path if os.path.isabs(rel_path)
                                 else os.path.join(project_dir, rel_path))
                     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                    open(abs_path, 'w', encoding='utf-8').write(content.strip() + '\n')
+                    open(abs_path, 'w', encoding='utf-8').write(clean_content(content) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{abs_path}{RESET}\n')
 
                 # ── Auto-execute setup commands (no confirmation) ──────────
@@ -945,30 +959,31 @@ def main():
                 prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
                           f'REQUEST: {mtask}\n\n'
                           'Modified file → [EDIT_FILE: path]...[/EDIT_FILE]\n'
-                          'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically, do NOT use [CMD] mkdir)\n'
+                          'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically)\n'
+                          'Do NOT wrap code inside tags with ``` blocks. Use RAW text.\n'
                           'Shell cmd → [CMD]cmd[/CMD]')
                 full = print_ai_stream(
                     stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
                 
                 m_old = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
                 if m_old:
-                    open(mfp, 'w', encoding='utf-8').write(m_old.group(1).strip() + '\n')
+                    open(mfp, 'w', encoding='utf-8').write(clean_content(m_old.group(1)) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
                 
                 for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    efp = efp.strip().replace('%DESKTOP%', get_desktop())
+                    efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
                     if not os.path.isabs(efp):
                         efp = os.path.join(os.path.dirname(os.path.abspath(mfp)), efp)
                     os.makedirs(os.path.dirname(efp), exist_ok=True)
-                    open(efp, 'w', encoding='utf-8').write(ec.strip() + '\n')
+                    open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
 
                 for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                    nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
+                    nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
                     if not os.path.isabs(nfp):
                         nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                    open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
+                    open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
                 for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
                     cmd = cmd.strip()
@@ -1003,23 +1018,23 @@ def main():
                 conversation.append({'role': 'assistant', 'content': full})
 
             for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
+                nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
                 if not os.path.isabs(nfp):
                     nfp = os.path.join(os.getcwd(), nfp)
                 try:
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                    open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
+                    open(nfp, 'w', encoding='utf-8').write(clean_content(nc) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
                 except Exception as e:
                     print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
 
             for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
-                efp = efp.strip().replace('%DESKTOP%', get_desktop())
+                efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
                 if not os.path.isabs(efp):
                     efp = os.path.join(os.getcwd(), efp)
                 try:
                     os.makedirs(os.path.dirname(efp), exist_ok=True)
-                    open(efp, 'w', encoding='utf-8').write(ec.strip() + '\n')
+                    open(efp, 'w', encoding='utf-8').write(clean_content(ec) + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
                 except Exception as e:
                     print(f'  {C_RED}✗  Could not update {efp}: {e}{RESET}\n')
