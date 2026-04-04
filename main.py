@@ -536,8 +536,10 @@ DEFAULT_SYS = (
     "You are a helpful AI assistant with full access to the user's computer. "
     "To create a file, you MUST use EXACTLY this format:\n"
     "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
+    "Directories are created automatically, do NOT use [CMD] mkdir.\n"
     "Do NOT wrap file content in markdown code blocks.\n"
     "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
+    "You will receive the command output in the next message. Reading commands (type, dir) execute silently in the background.\n"
     "Note: The shell is Windows CMD. Do NOT use `cat`, use `type`. "
     "Use %DESKTOP% for the Desktop path. "
     "Format other responses with markdown. Always confirm before destructive actions."
@@ -551,6 +553,7 @@ def stream_openrouter(messages, extra_system=None):
                'Content-Type': 'application/json',
                'HTTP-Referer': 'https://openrouter.ai'}
     sys_msg = extra_system or system_prompt or DEFAULT_SYS
+    sys_msg += f"\n\nCURRENT DIRECTORY: {os.getcwd()}"
     payload = {'model': model_name,
                'messages': [{'role': 'system', 'content': sys_msg}] + messages,
                'stream': True,
@@ -616,6 +619,13 @@ def get_desktop():
 
 def execute_command(cmd):
     cmd = cmd.replace('%DESKTOP%', get_desktop())
+    if cmd.lower().strip().startswith('cd '):
+        target = os.path.expanduser(os.path.expandvars(cmd.strip()[3:].strip()))
+        try:
+            os.chdir(target)
+            return f"[Directory changed to {os.getcwd()}]"
+        except Exception as e:
+            return f"[ERROR] {e}"
     try:
         if platform.system() == 'Windows':
             # chcp 65001 ensures Cyrillic paths and output work correctly
@@ -806,6 +816,16 @@ def main():
                 print(f'\n  {C_RED}Usage: model <model-name>{RESET}\n')
             continue
 
+        if lower.startswith('cd '):
+            new_dir = user_input[3:].strip()
+            new_dir = os.path.expandvars(os.path.expanduser(new_dir))
+            try:
+                os.chdir(new_dir)
+                print(f'\n  {C_GREEN}✓{RESET}  Changed directory to: {C_ACCENT}{os.getcwd()}{RESET}\n')
+            except Exception as e:
+                print(f'\n  {C_RED}✗  Cannot change directory: {e}{RESET}\n')
+            continue
+
         # ── Create project by prompt ───────────────────────────────────────────
         proj_path = detect_create_project(user_input)
         if proj_path:
@@ -833,6 +853,7 @@ def main():
                 "Your job is to fully implement the project described. "
                 "To create a file, you MUST use exactly this format:\n"
                 "[NEW_FILE: path/relative/to/project]\n...content...\n[/NEW_FILE]\n"
+                "Directories are created automatically, do NOT use [CMD] mkdir.\n"
                 "Do NOT wrap the file content in markdown code blocks.\n"
                 "For every shell command to run (install deps, init git, etc.), use [CMD]command[/CMD]. "
                 "In [CMD] blocks, use paths relative to the project directory or absolute paths. "
@@ -921,7 +942,7 @@ def main():
                 prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
                           f'REQUEST: {mtask}\n\n'
                           'Modified file → [MODIFIED_FILE]...[/MODIFIED_FILE]\n'
-                          'New file → [NEW_FILE: path]...[/NEW_FILE]\n'
+                          'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically, do NOT use [CMD] mkdir)\n'
                           'Shell cmd → [CMD]cmd[/CMD]')
                 full = print_ai_stream(
                     stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
@@ -953,38 +974,61 @@ def main():
         conversation.append({'role': 'user', 'content': user_input})
         msg_count += 1
 
-        full = ''
-        try:
-            full = print_ai_stream(stream_openrouter(conversation), model_name)
-        except KeyboardInterrupt:
-            print(f'\n  {C_GRAY}[Cancelled]{RESET}\n')
-            conversation.pop()
-            msg_count -= 1
-            continue
-
-        if full:
-            conversation.append({'role': 'assistant', 'content': full})
-
-        for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
-            nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
-            if not os.path.isabs(nfp):
-                nfp = os.path.join(os.getcwd(), nfp)
+        agent_loop_count = 0
+        while agent_loop_count < 5:
+            agent_loop_count += 1
+            full = ''
             try:
-                os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
-                print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
-            except Exception as e:
-                print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
+                full = print_ai_stream(stream_openrouter(conversation), model_name)
+            except KeyboardInterrupt:
+                print(f'\n  {C_GRAY}[Cancelled]{RESET}\n')
+                conversation.pop()
+                msg_count -= 1
+                break
 
-        for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
-            cmd = cmd.strip()
-            if cmd and confirm_exec(cmd):
-                out = execute_command(cmd)
-                print(f'\n    {C_GRAY}{out}{RESET}\n')
+            if full:
+                conversation.append({'role': 'assistant', 'content': full})
 
-        chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
-                       (user_input, full))
-        chat_conn.commit()
+            for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+                nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
+                if not os.path.isabs(nfp):
+                    nfp = os.path.join(os.getcwd(), nfp)
+                try:
+                    os.makedirs(os.path.dirname(nfp), exist_ok=True)
+                    open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
+                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
+                except Exception as e:
+                    print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
+
+            cmds = re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL)
+            if not cmds:
+                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
+                               (user_input, full))
+                chat_conn.commit()
+                break
+
+            cmd_results = []
+            for cmd in cmds:
+                cmd = cmd.strip()
+                if not cmd: continue
+                # Silent execution for safe reading commands
+                if cmd.lower().startswith(('type ', 'cat ', 'dir ', 'ls ', 'cd ')):
+                    out = execute_command(cmd)
+                    cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
+                else:
+                    if confirm_exec(cmd):
+                        out = execute_command(cmd)
+                        print(f'\n    {C_GRAY}{out}{RESET}\n')
+                        cmd_results.append(f"Result of `{cmd}`:\n```\n{out}\n```")
+                    else:
+                        cmd_results.append(f"Result of `{cmd}`: [USER DENIED EXECUTION]")
+            
+            if cmd_results:
+                msg = "Command outputs:\n" + "\n\n".join(cmd_results)
+                conversation.append({'role': 'user', 'content': msg})
+                msg_count += 1
+                continue
+
         print_status_bar(model_name, API_AVAILABLE, msg_count)
         print()
 
