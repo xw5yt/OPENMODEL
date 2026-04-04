@@ -204,6 +204,17 @@ def read_input(model_name):
     return user_input.strip()
 
 # ─── Spinner ──────────────────────────────────────────────────────────────────
+def format_elapsed(seconds):
+    mins = seconds // 60
+    secs = seconds % 60
+    hrs = mins // 60
+    if hrs > 0:
+        return f"{hrs}h {mins%60}m {secs}s"
+    elif mins > 0:
+        return f"{mins}m {secs}s"
+    else:
+        return f"{secs}s"
+
 class Spinner:
     FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
@@ -211,18 +222,39 @@ class Spinner:
         self.label   = label
         self._stop   = threading.Event()
         self._thread = None
+        self._start_time = 0
+        self.streamed_text = ''
+
+    def update_text(self, text):
+        self.streamed_text = text
 
     def _spin(self):
         i = 0
         while not self._stop.is_set():
-            f    = self.FRAMES[i % len(self.FRAMES)]
-            line = f'\r  {C_ACCENT2}{f}{RESET}  {DIM}{C_GRAY}{self.label}...{RESET}   '
-            sys.stdout.write(line)
+            f = self.FRAMES[i % len(self.FRAMES)]
+            elapsed = int(time.time() - self._start_time)
+            td_str = format_elapsed(elapsed)
+            
+            snippet = self.streamed_text.replace('\n', ' ')
+            snippet = re.sub(r'\x1b\[[0-9;]*m', '', snippet).strip()
+            
+            w = tw()
+            prefix = f'\r  {C_ACCENT2}{f}{RESET}  {DIM}{C_GRAY}{self.label} [{td_str}] '
+            
+            max_snip_len = max(0, w - vis_len(prefix) - 5)
+            if len(snippet) > max_snip_len and max_snip_len > 3:
+                snippet = "..." + snippet[-(max_snip_len-3):]
+            elif len(snippet) > max_snip_len:
+                snippet = ""
+                
+            line = prefix + snippet + RESET
+            sys.stdout.write(line + ' ' * max(0, w - vis_len(line)) + '\r')
             sys.stdout.flush()
             time.sleep(0.08)
             i += 1
 
     def start(self):
+        self._start_time = time.time()
         self._stop.clear()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
@@ -231,7 +263,7 @@ class Spinner:
         self._stop.set()
         if self._thread:
             self._thread.join()
-        sys.stdout.write('\r' + ' ' * 50 + '\r')
+        sys.stdout.write('\r' + ' ' * tw() + '\r')
         sys.stdout.flush()
 
 # ─── Message display ──────────────────────────────────────────────────────────
@@ -276,6 +308,7 @@ def print_ai_response(text):
     width = min(W - 8, 96)
     lines = text.split('\n')
     in_code, lang, code_buf = False, '', []
+    in_think = False
 
     def flush_code():
         nonlocal code_buf, lang
@@ -293,6 +326,21 @@ def print_ai_response(text):
     i = 0
     while i < len(lines):
         line = lines[i]
+        
+        has_think_start = '<think>' in line
+        has_think_end   = '</think>' in line
+        if has_think_start:
+            in_think = True
+            line = line.replace('<think>', '')
+        if has_think_end:
+            in_think = False
+            line = line.replace('</think>', '')
+        if (has_think_start or has_think_end) and not line.strip():
+            i += 1
+            continue
+            
+        tc = DIM + C_GRAY if in_think else C_WHITE
+
         if line.startswith('```'):
             if not in_code:
                 in_code = True
@@ -326,14 +374,14 @@ def print_ai_response(text):
                       else f'    {"  " * (indent // 2)}{C_ACCENT}▸{RESET} ')
             pv = vis_len(pfx)
             for j, wl in enumerate(textwrap.wrap(rest, width - pv + 4) or ['']):
-                print((pfx if j == 0 else ' ' * pv) + C_WHITE + render_inline(wl) + RESET)
+                print((pfx if j == 0 else ' ' * pv) + tc + render_inline(wl) + RESET)
             i += 1
             continue
         if not line.strip():
             print()
         else:
             for row in textwrap.wrap(line, width) or ['']:
-                print(f'    {C_WHITE}{render_inline(row)}{RESET}')
+                print(f'    {tc}{render_inline(row)}{RESET}')
         i += 1
     if in_code and code_buf:
         flush_code()
@@ -343,17 +391,22 @@ def print_ai_stream(generator, mdl):
     spinner = Spinner('Thinking')
     spinner.start()
     full = ''
+    start_time = time.time()
 
     for token in generator:
         full += token
+        spinner.update_text(full)
 
     spinner.stop()
+    elapsed = int(time.time() - start_time)
 
     if full.strip():
         _ai_header(mdl)
         print()
         print_ai_response(full)
         print()
+        td_str = format_elapsed(elapsed)
+        print(f'    {DIM}{C_GRAY}Thought for {td_str}{RESET}\n')
     return full
 
 # ─── Config DB ────────────────────────────────────────────────────────────────
@@ -481,10 +534,13 @@ API_AVAILABLE = check_api()
 # ─── OpenRouter streaming ─────────────────────────────────────────────────────
 DEFAULT_SYS = (
     "You are a helpful AI assistant with full access to the user's computer. "
-    "When you need to run a shell command, wrap it in [CMD]command[/CMD] tags. "
+    "To create a file, you MUST use EXACTLY this format:\n"
+    "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
+    "Do NOT wrap file content in markdown code blocks.\n"
+    "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
+    "Note: The shell is Windows CMD. Do NOT use `cat`, use `type`. "
     "Use %DESKTOP% for the Desktop path. "
-    "Format responses with markdown: **bold**, *italic*, `code`, ```language\\ncode\\n```. "
-    "Always confirm before destructive actions."
+    "Format other responses with markdown. Always confirm before destructive actions."
 )
 
 def stream_openrouter(messages, extra_system=None):
@@ -497,8 +553,10 @@ def stream_openrouter(messages, extra_system=None):
     sys_msg = extra_system or system_prompt or DEFAULT_SYS
     payload = {'model': model_name,
                'messages': [{'role': 'system', 'content': sys_msg}] + messages,
-               'stream': True}
+               'stream': True,
+               'include_reasoning': True}
     try:
+        in_reasoning = False
         with requests.post('https://openrouter.ai/api/v1/chat/completions',
                            headers=headers, json=payload, stream=True, timeout=60) as resp:
             resp.encoding = 'utf-8'
@@ -517,9 +575,23 @@ def stream_openrouter(messages, extra_system=None):
                 except json.JSONDecodeError:
                     continue
                 if 'choices' in data and data['choices']:
-                    content = data['choices'][0].get('delta', {}).get('content', '')
-                    if content:
-                        yield content
+                    delta = data['choices'][0].get('delta', {})
+                    reasoning_chunk = delta.get('reasoning', '')
+                    content_chunk = delta.get('content', '')
+                    
+                    if reasoning_chunk:
+                        if not in_reasoning:
+                            yield '<think>\n'
+                            in_reasoning = True
+                        yield reasoning_chunk
+                        
+                    if content_chunk:
+                        if in_reasoning:
+                            yield '\n</think>\n'
+                            in_reasoning = False
+                        yield content_chunk
+        if in_reasoning:
+            yield '\n</think>\n'
     except Exception as e:
         yield f'[API ERROR] {e}'
 
@@ -546,11 +618,17 @@ def execute_command(cmd):
     cmd = cmd.replace('%DESKTOP%', get_desktop())
     try:
         if platform.system() == 'Windows':
-            r = subprocess.run(['cmd.exe', '/c', cmd], capture_output=True, text=True,
-                               timeout=15, encoding='utf-8', errors='replace', env=os.environ.copy())
+            # chcp 65001 ensures Cyrillic paths and output work correctly
+            full_cmd = f'chcp 65001 >nul 2>&1 & {cmd}'
+            r = subprocess.run(
+                ['cmd.exe', '/c', full_cmd],
+                capture_output=True, text=True,
+                timeout=30, encoding='utf-8', errors='replace',
+                env={**os.environ.copy(), 'PYTHONUTF8': '1'}
+            )
         else:
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                               timeout=15, encoding='utf-8', errors='replace')
+                               timeout=30, encoding='utf-8', errors='replace')
         out = r.stdout.strip()
         err = r.stderr.strip()
         return (out + ('\n' + err if err else '')) or '[Command executed successfully]'
@@ -586,7 +664,18 @@ def detect_modify(text):
     m = re.search(r'(?:измени|modify|change|edit)\s+([^\s]+)\s+(.*)', text, re.IGNORECASE)
     return (m.group(1).strip('"\''), m.group(2).strip()) if m else (None, None)
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
+def detect_create_project(text):
+    """Detect create/build <X> by/from prompt/spec/readme <path>"""
+    patterns = [
+        r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*["\'](.+?)["\']',
+        r'(?:создай|сделай|напиши|разработай|сгенерируй|create|build|make|init|start|generate|develop|code|write|craete|creet)\s+.{0,50}?\s+(?:по|из|следуя|согласно|используя|на основе|by|from|using|following|with|based on)\s+(?:this\s+|этому?\s+)?(?:prompt|readme|spec|file|description|промту?|промпту?|файлу?|описанию?)?[:\s]*([^\s"\']+(\.[a-zA-Z]+))',
+    ]
+    for p in patterns:
+        m = re.search(p, text.strip(), re.IGNORECASE)
+        if m:
+            return m.group(1).strip().strip('"\'')
+    return None
+
 def show_help():
     W = tw()
     print()
@@ -717,6 +806,86 @@ def main():
                 print(f'\n  {C_RED}Usage: model <model-name>{RESET}\n')
             continue
 
+        # ── Create project by prompt ───────────────────────────────────────────
+        proj_path = detect_create_project(user_input)
+        if proj_path:
+            # Resolve path (handles spaces, Cyrillic, relative paths)
+            proj_path = os.path.expandvars(os.path.expanduser(proj_path.strip()))
+            if not os.path.exists(proj_path):
+                print(f'\n  {C_RED}✗  File not found: {proj_path}{RESET}\n')
+                continue
+
+            print_user_msg(user_input, nickname)
+
+            # ── Read file SILENTLY via Python (no CMD, no confirmation) ────────
+            try:
+                prompt_content = open(proj_path, encoding='utf-8', errors='replace').read()
+            except Exception as e:
+                print(f'\n  {C_RED}✗  Cannot read file: {e}{RESET}\n')
+                continue
+
+            # Project dir = folder containing the prompt file
+            project_dir = os.path.dirname(os.path.abspath(proj_path))
+
+            project_sys = (
+                "You are an expert software developer. "
+                "The user has provided a project specification/README. "
+                "Your job is to fully implement the project described. "
+                "To create a file, you MUST use exactly this format:\n"
+                "[NEW_FILE: path/relative/to/project]\n...content...\n[/NEW_FILE]\n"
+                "Do NOT wrap the file content in markdown code blocks.\n"
+                "For every shell command to run (install deps, init git, etc.), use [CMD]command[/CMD]. "
+                "In [CMD] blocks, use paths relative to the project directory or absolute paths. "
+                "Do NOT ask clarifying questions — implement everything described. "
+                "Use markdown in explanations only, not inside file content tags."
+            )
+            build_prompt = (
+                f"PROJECT DIRECTORY: {project_dir}\n\n"
+                f"SPECIFICATION:\n```\n{prompt_content}\n```\n\n"
+                "Implement this project fully. Create all necessary files and run all needed commands."
+            )
+
+            try:
+                full = print_ai_stream(
+                    stream_openrouter(
+                        [{'role': 'user', 'content': build_prompt}],
+                        extra_system=project_sys
+                    ),
+                    model_name
+                )
+
+                # ── Auto-create files (no confirmation needed) ─────────────
+                for rel_path, content in re.findall(
+                        r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+                    rel_path = rel_path.strip().replace('%DESKTOP%', get_desktop())
+                    abs_path = (rel_path if os.path.isabs(rel_path)
+                                else os.path.join(project_dir, rel_path))
+                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                    open(abs_path, 'w', encoding='utf-8').write(content.strip() + '\n')
+                    print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{abs_path}{RESET}\n')
+
+                # ── Auto-execute setup commands (no confirmation) ──────────
+                for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
+                    cmd = cmd.strip()
+                    if not cmd:
+                        continue
+                    # Run commands from project directory
+                    orig_cwd = os.getcwd()
+                    try:
+                        os.chdir(project_dir)
+                        out = execute_command(cmd)
+                    finally:
+                        os.chdir(orig_cwd)
+                    if out and out != '[Command executed successfully]':
+                        print(f'\n    {C_GRAY}{out[:400]}{RESET}\n')
+
+                chat_c.execute('INSERT INTO chats (user_input, ai_response) VALUES (?,?)',
+                               (user_input, full))
+                chat_conn.commit()
+            except Exception as e:
+                print(f'\n  {C_RED}Error: {e}{RESET}\n')
+            continue
+
         # ── File read ──────────────────────────────────────────────────────────
         fp, inst = detect_read(user_input)
         if fp:
@@ -752,7 +921,7 @@ def main():
                 prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
                           f'REQUEST: {mtask}\n\n'
                           'Modified file → [MODIFIED_FILE]...[/MODIFIED_FILE]\n'
-                          'New file → [NEW_FILE path]...[/NEW_FILE]\n'
+                          'New file → [NEW_FILE: path]...[/NEW_FILE]\n'
                           'Shell cmd → [CMD]cmd[/CMD]')
                 full = print_ai_stream(
                     stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
@@ -760,8 +929,8 @@ def main():
                 if m:
                     open(mfp, 'w', encoding='utf-8').write(m.group(1).strip())
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
-                for nfp, nc in re.findall(r'\[NEW_FILE\s+([^\]]+)\](.*?)\[/NEW_FILE\]', full, re.DOTALL):
-                    nfp = nfp.strip()
+                for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+                    nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
                     if not os.path.isabs(nfp):
                         nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
@@ -795,6 +964,17 @@ def main():
 
         if full:
             conversation.append({'role': 'assistant', 'content': full})
+
+        for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+            nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
+            if not os.path.isabs(nfp):
+                nfp = os.path.join(os.getcwd(), nfp)
+            try:
+                os.makedirs(os.path.dirname(nfp), exist_ok=True)
+                open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
+                print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
+            except Exception as e:
+                print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
 
         for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
             cmd = cmd.strip()
