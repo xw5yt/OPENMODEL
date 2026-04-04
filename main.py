@@ -534,10 +534,13 @@ API_AVAILABLE = check_api()
 # ─── OpenRouter streaming ─────────────────────────────────────────────────────
 DEFAULT_SYS = (
     "You are a helpful AI assistant with full access to the user's computer. "
-    "To create a file, you MUST use EXACTLY this format:\n"
+    "To create a new file, use EXACTLY this format:\n"
     "[NEW_FILE: path/to/file]\n...file content...\n[/NEW_FILE]\n"
+    "To modify an existing file, use EXACTLY this format:\n"
+    "[EDIT_FILE: path/to/file]\n...full new content...\n[/EDIT_FILE]\n"
     "Directories are created automatically, do NOT use [CMD] mkdir.\n"
     "Do NOT wrap file content in markdown code blocks.\n"
+    "Apply changes directly using [EDIT_FILE]. Do NOT create temporary files for transferring code. If you create temp files, delete them with [CMD]del path[/CMD] when done.\n"
     "To run a shell command, wrap it in [CMD]command[/CMD] tags. "
     "You will receive the command output in the next message. Reading commands (type, dir) execute silently in the background.\n"
     "Note: The shell is Windows CMD. Do NOT use `cat`, use `type`. "
@@ -877,7 +880,7 @@ def main():
 
                 # ── Auto-create files (no confirmation needed) ─────────────
                 for rel_path, content in re.findall(
-                        r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+                        r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
                     rel_path = rel_path.strip().replace('%DESKTOP%', get_desktop())
                     abs_path = (rel_path if os.path.isabs(rel_path)
                                 else os.path.join(project_dir, rel_path))
@@ -941,21 +944,31 @@ def main():
                 orig   = open(mfp, encoding='utf-8', errors='replace').read()
                 prompt = (f'FILE: {mfp}\n\nORIGINAL:\n```\n{orig}\n```\n\n'
                           f'REQUEST: {mtask}\n\n'
-                          'Modified file → [MODIFIED_FILE]...[/MODIFIED_FILE]\n'
+                          'Modified file → [EDIT_FILE: path]...[/EDIT_FILE]\n'
                           'New file → [NEW_FILE: path]...[/NEW_FILE] (Directories are created automatically, do NOT use [CMD] mkdir)\n'
                           'Shell cmd → [CMD]cmd[/CMD]')
                 full = print_ai_stream(
                     stream_openrouter([{'role': 'user', 'content': prompt}]), model_name)
-                m = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
-                if m:
-                    open(mfp, 'w', encoding='utf-8').write(m.group(1).strip())
+                
+                m_old = re.search(r'\[MODIFIED_FILE\](.*?)\[/MODIFIED_FILE\]', full, re.DOTALL)
+                if m_old:
+                    open(mfp, 'w', encoding='utf-8').write(m_old.group(1).strip() + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{mfp}{RESET}\n')
-                for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+                
+                for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
+                    efp = efp.strip().replace('%DESKTOP%', get_desktop())
+                    if not os.path.isabs(efp):
+                        efp = os.path.join(os.path.dirname(os.path.abspath(mfp)), efp)
+                    os.makedirs(os.path.dirname(efp), exist_ok=True)
+                    open(efp, 'w', encoding='utf-8').write(ec.strip() + '\n')
+                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
+
+                for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                     nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
                     if not os.path.isabs(nfp):
                         nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
-                    open(nfp, 'w', encoding='utf-8').write(nc.strip())
+                    open(nfp, 'w', encoding='utf-8').write(nc.strip() + '\n')
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
                 for cmd in re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL):
                     cmd = cmd.strip()
@@ -989,7 +1002,7 @@ def main():
             if full:
                 conversation.append({'role': 'assistant', 'content': full})
 
-            for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[NEW_FILE)|\Z)', full, re.DOTALL):
+            for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                 nfp = nfp.strip().replace('%DESKTOP%', get_desktop())
                 if not os.path.isabs(nfp):
                     nfp = os.path.join(os.getcwd(), nfp)
@@ -999,6 +1012,17 @@ def main():
                     print(f'  {C_GREEN}✓{RESET}  Created: {C_ACCENT}{nfp}{RESET}\n')
                 except Exception as e:
                     print(f'  {C_RED}✗  Could not create {nfp}: {e}{RESET}\n')
+
+            for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
+                efp = efp.strip().replace('%DESKTOP%', get_desktop())
+                if not os.path.isabs(efp):
+                    efp = os.path.join(os.getcwd(), efp)
+                try:
+                    os.makedirs(os.path.dirname(efp), exist_ok=True)
+                    open(efp, 'w', encoding='utf-8').write(ec.strip() + '\n')
+                    print(f'  {C_GREEN}✓{RESET}  Updated: {C_ACCENT}{efp}{RESET}\n')
+                except Exception as e:
+                    print(f'  {C_RED}✗  Could not update {efp}: {e}{RESET}\n')
 
             cmds = re.findall(r'\[CMD\](.*?)\[/CMD\]', full, re.DOTALL)
             if not cmds:
