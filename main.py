@@ -76,6 +76,11 @@ def clean_path(path):
     # Remove some extremely invalid chars for windows paths if accidentally generated
     return re.sub(r'[*?<>|]', '', path)
 
+def is_dummy_path(p):
+    if not p: return True
+    p = p.replace('\\', '/').strip().lower()
+    return p in ('path/to/file', 'path/relative/to/project', 'path', 'path/to/cmd', 'to cmd', 'path/to/file.ext', 'filename.ext', 'path/to')
+
 
 # ─── Logo ─────────────────────────────────────────────────────────────────────
 LOGO_BIG = [
@@ -88,9 +93,12 @@ LOGO_BIG = [
 ]
 
 LOGO_MID = [
-    "┌─┐┌─┐┌─┐┌┐┌┌┬┐┌─┐┌┬┐┌─┐┬  ",
-    "│ │├─┘├┤ │││││││ │ │ │├┤ │  ",
-    "└─┘┴  └─┘┘└┘┴ ┴└─┘ ┴ └─┘┴─┘",
+    " ██████╗  ███╗   ███╗ ",
+    "██╔═══██╗ █████╗ ███║",
+    "██║   ██║ ██╔████╔██║",
+    "██║   ██║ ██║╚██╔╝██║",
+    "╚██████╔╝ ██║ ╚═╝ ██║",
+    " ╚═════╝  ╚═╝     ╚═╝",
 ]
 
 def print_logo():
@@ -147,7 +155,7 @@ def _panel_blank(dim=False):
 def _model_row(model_name):
     content = (f' {DIM}{C_GRAY}agent{RESET}{BG_PANEL}   '
                f'{C_ACCENT}{BOLD}{model_name}{RESET}{BG_PANEL}   '
-               f'{DIM}{C_GRAY}openmodel{RESET}')
+               f'{DIM}{C_GRAY}openmodel')
     _panel_row(content, use_accent=False)
 
 def _hints_line():
@@ -189,31 +197,47 @@ def read_input(model_name):
     pp = _pp()
     sp = ' ' * pp
 
-    # Draw 3 rows upfront so all are same width
-    # Row 1 - top bar
+    # Panel top rows
     _panel_blank(dim=True)
-    # Row 2 - input row: full dark bg, dim accent marker (repainted below)
-    print(sp + BG_PANEL + ' ' + C_DIM_C + '▍' + RESET +
-          BG_PANEL + ' ' * (pw - 1) + RESET)
-    # Row 3 - bottom bar (same width)
-    _panel_blank(dim=True)
+    _panel_sep()
 
-    # Reposition cursor to row 2 for actual input
-    sys.stdout.write('\033[2A\r')   # up 2 rows, col 0
-    active_prefix = sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET + BG_PANEL + C_ACCENT + '  '
-    sys.stdout.write(active_prefix)
-    sys.stdout.flush()
+    # Draw the full input row filled with panel background so the whole row is visible.
+    # fill = pw-3 to match the exact visual width of other panel rows (pp+pw+1 total).
+    fill = max(0, pw - 3)
+    active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
+                   + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
+    # Move cursor left back to typing position (after the 4-char prefix).
+    move_back = f'\033[{fill}D'
+    sys.stdout.write(active_full + move_back)
 
-    user_input = input()   # on Enter cursor lands at start of row 3
-
-    # Overwrite row 3 with separator, render footer below
-    sys.stdout.write('\r')
+    # Draw rows BELOW the input line, then move cursor back UP with relative
+    # movement (\033[3A). Using \033[s/\033[u (DECSC/DECRC) broke on the 2nd+
+    # prompt because after scrolling the restored position landed outside the
+    # viewport, sending the cursor to the bottom of the screen.
+    sys.stdout.write('\n')          # move down to start drawing footer rows
     _panel_sep()
     _model_row(model_name)
     _panel_blank(dim=True)
+    sys.stdout.write('\033[4A')     # move cursor UP 4 lines → back to input line
+    # Move to the typing column: pp (left indent) + 4 printable prefix chars (' ▍  ')
+    sys.stdout.write(f'\033[{pp + 5}G')   # absolute column (1-indexed)
+    sys.stdout.write(BG_PANEL + C_WHITE)  # keep panel bg for typed chars
+    sys.stdout.flush()
+
+    user_input = input()
+    sys.stdout.write(RESET)  # reset bg color immediately — prevents BG_PANEL bleeding to full terminal width on Enter
+
+    # After Enter cursor is on the line just below the input line (pre-drawn sep).
+    # Go up one line, clear the input line, redraw as a clean blank panel row.
+    sys.stdout.write('\033[1A\033[2K\r')
+    _panel_blank(dim=True)
+
+    # sep / model / blank are already on screen — skip cursor past them (3 rows).
+    sys.stdout.write('\033[3B\r')
     print()
     _hints_line()
     print()
+
     return user_input.strip()
 
 # ─── Spinner ──────────────────────────────────────────────────────────────────
@@ -423,7 +447,10 @@ def print_ai_stream(generator, mdl):
     return full
 
 # ─── Config DB ────────────────────────────────────────────────────────────────
-CONFIG_DB = 'config.db'
+USERDATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "userdata")
+os.makedirs(USERDATA_DIR, exist_ok=True)
+
+CONFIG_DB = os.path.join(USERDATA_DIR, 'config.db')
 conn = sqlite3.connect(CONFIG_DB)
 c    = conn.cursor()
 c.execute("""CREATE TABLE IF NOT EXISTS config (
@@ -521,7 +548,7 @@ else:
     api_key, model_name, nickname, system_prompt = setup_wizard()
 
 # ─── Chat DB ──────────────────────────────────────────────────────────────────
-CHATS_DB = 'chats.db'
+CHATS_DB = os.path.join(USERDATA_DIR, 'chats.db')
 chat_conn = sqlite3.connect(CHATS_DB)
 chat_c    = chat_conn.cursor()
 chat_c.execute("""CREATE TABLE IF NOT EXISTS chats (
@@ -896,6 +923,7 @@ def main():
                 for rel_path, content in re.findall(
                         r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|CMD))|\Z)', full, re.DOTALL):
                     rel_path = clean_path(rel_path.replace('%DESKTOP%', get_desktop()))
+                    if is_dummy_path(rel_path): continue
                     abs_path = (rel_path if os.path.isabs(rel_path)
                                 else os.path.join(project_dir, rel_path))
                     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
@@ -972,6 +1000,7 @@ def main():
                 
                 for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                     efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
+                    if is_dummy_path(efp): continue
                     if not os.path.isabs(efp):
                         efp = os.path.join(os.path.dirname(os.path.abspath(mfp)), efp)
                     os.makedirs(os.path.dirname(efp), exist_ok=True)
@@ -980,6 +1009,7 @@ def main():
 
                 for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                     nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
+                    if is_dummy_path(nfp): continue
                     if not os.path.isabs(nfp):
                         nfp = os.path.join(os.path.dirname(os.path.abspath(mfp)), nfp)
                     os.makedirs(os.path.dirname(nfp), exist_ok=True)
@@ -1019,6 +1049,7 @@ def main():
 
             for nfp, nc in re.findall(r'\[NEW_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/NEW_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                 nfp = clean_path(nfp.replace('%DESKTOP%', get_desktop()))
+                if is_dummy_path(nfp): continue
                 if not os.path.isabs(nfp):
                     nfp = os.path.join(os.getcwd(), nfp)
                 try:
@@ -1030,6 +1061,7 @@ def main():
 
             for efp, ec in re.findall(r'\[EDIT_FILE[\s:\]]*([^\]\n<>]+)[\]\s]*(.*?)(?:\[/EDIT_FILE\]|(?=\[(?:NEW_FILE|EDIT_FILE|CMD))|\Z)', full, re.DOTALL):
                 efp = clean_path(efp.replace('%DESKTOP%', get_desktop()))
+                if is_dummy_path(efp): continue
                 if not os.path.isabs(efp):
                     efp = os.path.join(os.getcwd(), efp)
                 try:

@@ -2,13 +2,14 @@
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-cd /d "%~dp0"
+rem переходим из python\ в OPENMODEL\
+cd /d "%~dp0.."
 
-set "PYTHON_EXE=%~dp0python\python.exe"
+rem путь к python.exe (он в текущей папке python\)
+set "PYTHON_EXE=%~dp0python.exe"
 
 if not exist "%PYTHON_EXE%" (
     echo [ERROR] Python not found at: "%PYTHON_EXE%"
-    echo Make sure the 'python' folder is next to this file.
     pause
     exit /b 1
 )
