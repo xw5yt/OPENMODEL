@@ -2,17 +2,42 @@ import sqlite3, os, time, sys, requests, platform, json, io, subprocess, re, shu
 from pathlib import Path
 from datetime import datetime
 
+# ─── Optional: prompt_toolkit for proper input wrap/indent ────────────────────
+try:
+    from prompt_toolkit import prompt as _pt_prompt
+    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+    _HAS_PT = True
+except ImportError:
+    _HAS_PT = False
+
 # ─── Windows UTF-8 + VT100 ANSI fix ─────────────────────────────────────────
 if platform.system() == "Windows":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-    # Enable VT processing so ANSI escape codes (colors, cursor) work in cmd/WT
+    # Step 1: Enable VT processing FIRST, before any stdout wrapping.
+    # ENABLE_PROCESSED_OUTPUT            = 0x0001
+    # ENABLE_WRAP_AT_EOL_OUTPUT          = 0x0002
+    # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    _VT_FLAGS = 0x0001 | 0x0002 | 0x0004
+    _INVALID_HANDLE = -1  # INVALID_HANDLE_VALUE as signed int
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        _kernel32 = ctypes.windll.kernel32
+        for _hid in (-10, -11, -12):   # stdin, stdout, stderr handles
+            _h = _kernel32.GetStdHandle(_hid)
+            # Skip invalid handles (may happen when launched via shortcut/UAC)
+            if _h == 0 or ctypes.c_long(_h).value == _INVALID_HANDLE:
+                continue
+            _m = ctypes.c_ulong(0)
+            if _kernel32.GetConsoleMode(_h, ctypes.byref(_m)):
+                _kernel32.SetConsoleMode(_h, _m.value | _VT_FLAGS)
     except Exception:
         pass
+
+    # Step 2: Flush before wrapping so no buffered bytes are lost.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Step 3: Wrap stdout/stderr for UTF-8 AFTER VT is enabled.
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # ─── ANSI helpers ─────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -191,6 +216,122 @@ def render_home(model_name, api_ok):
     print_status_bar(model_name, api_ok)
     print()
 
+# ─── Windows raw input (handles wrap manually via msvcrt) ─────────────────────
+def _windows_raw_input(start_col, panel_right_col, pp):
+    """
+    Character-by-character input for Windows.
+
+    The full panel (including footer rows) is pre-drawn before this is called.
+    When text reaches panel_right_col we:
+      1. Move to next line  (\n)
+      2. Insert a blank line (\033[L) — pushes footer rows down by 1
+      3. Print continuation prefix (dim ▍ aligned with panel)
+    On Enter we skip past the footer with \033[3B so the caller can continue
+    drawing normally below it.
+
+    line_count tracks how many extra wrapped lines we've added so that
+    backspace past the start of a continuation line moves the cursor up.
+    """
+    import msvcrt
+    pw         = panel_right_col - pp   # panel width, derived from caller args
+    chars      = []
+    col        = start_col
+    line_count = 0          # number of wrapped continuation lines added
+
+    # Track how many chars belong to each line so we can navigate up correctly.
+    # line_lengths[0] = chars on the first (original) line,
+    # line_lengths[i] = chars on continuation line i.
+    # We only need to know when a line is "empty" to go back up.
+    chars_per_line = [0]    # chars on each visual line (index = line_count)
+
+    # Immediately set BG so the input row has the correct background colour
+    # even before the first keypress.
+    sys.stdout.write(BG_PANEL + C_WHITE)
+    sys.stdout.flush()
+
+    while True:
+        ch = msvcrt.getwch()
+
+        if ch == '\r':                          # Enter
+            # \n lands cursor on the pre-drawn sep row (footer row 1).
+            # \033[3B skips sep + model + blank → cursor below the panel.
+            # If we've added continuation lines the footer was already pushed
+            # down by line_count rows, so we only need 3B (the footer is always
+            # 3 rows below the *current* line after the last wrap).
+            sys.stdout.write('\n\033[3B\r')
+            sys.stdout.flush()
+            break
+
+        if ch == '\x03':                        # Ctrl-C
+            raise KeyboardInterrupt
+
+        if ch == '\x08':                        # Backspace
+            if chars:
+                chars.pop()
+                chars_per_line[line_count] -= 1
+
+                if col > start_col:
+                    # Normal backspace within current line
+                    sys.stdout.write('\b \b')
+                    col -= 1
+                elif line_count > 0:
+                    # At start of a continuation line — erase it and go up.
+                    line_count -= 1
+                    chars_per_line.pop()
+
+                    # 1) Erase the continuation line visually
+                    sys.stdout.write('\033[2K\r')
+                    # 2) Move cursor up one row (back to previous input line)
+                    sys.stdout.write('\033[1A')
+                    # 3) Now delete the empty line that's sitting below the cursor
+                    #    (\033[M deletes line at cursor, content below scrolls up),
+                    #    restoring the footer rows to their correct position.
+                    sys.stdout.write('\033[1B\033[M\033[1A')
+                    # 4) Position cursor at end of previous line's text
+                    prev_chars = chars_per_line[line_count]
+                    col = start_col + prev_chars
+                    sys.stdout.write(f'\033[{col + 1}G')  # 1-indexed absolute col
+                    sys.stdout.write(BG_PANEL + C_WHITE)
+                # else: at very start of first line, nothing to erase
+            sys.stdout.flush()
+            continue
+
+        if ch in ('\x00', '\xe0'):              # special / arrow keys — skip
+            msvcrt.getwch()
+            continue
+
+        # Ordinary printable character
+        chars.append(ch)
+        chars_per_line[line_count] += 1
+        sys.stdout.write(ch)
+        col += 1
+
+        # Wrap at panel right edge
+        if col >= panel_right_col:
+            line_count += 1
+            chars_per_line.append(0)
+            # Panel visible width = pw cols total:
+            #   ' '(1) + '▍'(1) + '  '(2) + fill(pw-4) = pw  ✓
+            # typing_width = pw - 4 matches the first input line fill.
+            typing_width = pw - 4
+            cont = (RESET
+                    + '\n\033[L'
+                    + ' ' * pp                          # outside panel — no BG
+                    + BG_PANEL + ' ' + C_DIM_C + '▍'   # left accent bar
+                    + BG_PANEL + '  '                   # 2-space indent
+                    + ' ' * typing_width                # fill panel interior with BG
+                    + RESET                             # stop BG at right edge
+                    + f'\033[{start_col + 1}G'          # jump cursor back to typing start
+                    + BG_PANEL + C_WHITE)               # restore colour for typing
+            sys.stdout.write(cont)
+            col = start_col
+
+        sys.stdout.flush()
+
+    sys.stdout.write(RESET)
+    return ''.join(chars)
+
+
 # ─── Interactive input panel ──────────────────────────────────────────────────
 def read_input(model_name):
     pw = _pw()
@@ -201,39 +342,83 @@ def read_input(model_name):
     _panel_blank(dim=True)
     _panel_sep()
 
-    # Draw the full input row filled with panel background so the whole row is visible.
-    # fill = pw-3 to match the exact visual width of other panel rows (pp+pw+1 total).
-    fill = max(0, pw - 3)
-    active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
-                   + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
-    # Move cursor left back to typing position (after the 4-char prefix).
-    move_back = f'\033[{fill}D'
-    sys.stdout.write(active_full + move_back)
+    # Visual prefix: pp spaces + ' ' + '▍' + '  '  →  pp+4 printable chars.
+    # This is the column index (0-based) where typing actually starts.
+    PROMPT_VIS = pp + 4
 
-    # Draw rows BELOW the input line, then move cursor back UP with relative
-    # movement (\033[3A). Using \033[s/\033[u (DECSC/DECRC) broke on the 2nd+
-    # prompt because after scrolling the restored position landed outside the
-    # viewport, sending the cursor to the bottom of the screen.
-    sys.stdout.write('\n')          # move down to start drawing footer rows
-    _panel_sep()
-    _model_row(model_name)
-    _panel_blank(dim=True)
-    sys.stdout.write('\033[4A')     # move cursor UP 4 lines → back to input line
-    # Move to the typing column: pp (left indent) + 4 printable prefix chars (' ▍  ')
-    sys.stdout.write(f'\033[{pp + 5}G')   # absolute column (1-indexed)
-    sys.stdout.write(BG_PANEL + C_WHITE)  # keep panel bg for typed chars
-    sys.stdout.flush()
+    if _HAS_PT:
+        # ── prompt_toolkit path (any OS) ──────────────────────────────────────
+        # prompt_toolkit draws the prompt itself and handles continuation indent.
+        pt_prompt_str = (BG_PANEL + sp + ' ' + C_ACCENT + '▍'
+                         + RESET + BG_PANEL + C_WHITE + '  ')
 
-    user_input = input()
-    sys.stdout.write(RESET)  # reset bg color immediately — prevents BG_PANEL bleeding to full terminal width on Enter
+        sys.stdout.flush()
+        try:
+            user_input = _pt_prompt(
+                _PT_ANSI(pt_prompt_str),
+                prompt_continuation=' ' * PROMPT_VIS,
+                multiline=False,
+            )
+        except (EOFError, KeyboardInterrupt):
+            user_input = ''
+        sys.stdout.write(RESET)
 
-    # After Enter cursor is on the line just below the input line (pre-drawn sep).
-    # Go up one line, clear the input line, redraw as a clean blank panel row.
-    sys.stdout.write('\033[1A\033[2K\r')
-    _panel_blank(dim=True)
+        sys.stdout.write('\033[1A\033[2K\r')
+        _panel_blank(dim=True)
+        _panel_sep()
+        _model_row(model_name)
+        _panel_blank(dim=True)
 
-    # sep / model / blank are already on screen — skip cursor past them (3 rows).
-    sys.stdout.write('\033[3B\r')
+    elif platform.system() == 'Windows':
+        # ── Windows raw-input path ────────────────────────────────────────────
+        # Pre-draw the full panel including footer rows, then move cursor back
+        # to the typing column. _windows_raw_input uses \033[L (insert line)
+        # on wrap to push footer rows down without overwriting them.
+        fill = max(0, pw - 4)
+        active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
+                       + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
+        sys.stdout.write(active_full + '\n')
+        _panel_sep()
+        _model_row(model_name)
+        _panel_blank(dim=True)
+        sys.stdout.write('\033[4A')                  # up 4 → back to input row
+        sys.stdout.write(f'\033[{PROMPT_VIS + 1}G')  # absolute col (1-indexed)
+        sys.stdout.write(BG_PANEL + C_WHITE)
+        sys.stdout.flush()
+
+        panel_right_col = pp + pw
+        user_input = _windows_raw_input(PROMPT_VIS, panel_right_col, pp)
+        # Cursor is now below the footer — no extra drawing needed.
+
+    else:
+        # ── Unix/macOS readline path ──────────────────────────────────────────
+        # \001 / \002 bracket non-printing escape sequences so that readline
+        # counts the correct visible prompt width (PROMPT_VIS chars) and wraps
+        # input at the real terminal edge.
+        fill = max(0, pw - 4)
+        active_full = (sp + BG_PANEL + ' ' + C_ACCENT + '▍' + RESET
+                       + BG_PANEL + C_WHITE + '  ' + ' ' * fill + RESET)
+        sys.stdout.write(active_full)
+        sys.stdout.write('\n')
+        _panel_sep()
+        _model_row(model_name)
+        _panel_blank(dim=True)
+        sys.stdout.write('\033[4A\r')
+        sys.stdout.flush()
+
+        def _rl(s): return f'\001{s}\002'
+        rl_prompt = (
+            _rl(BG_PANEL) + sp + ' '
+            + _rl(C_ACCENT) + '▍'
+            + _rl(RESET + BG_PANEL + C_WHITE) + '  '
+        )
+        user_input = input(rl_prompt)
+        sys.stdout.write(RESET)
+
+        sys.stdout.write('\033[1A\033[2K\r')
+        _panel_blank(dim=True)
+        sys.stdout.write('\033[3B\r')
+
     print()
     _hints_line()
     print()
